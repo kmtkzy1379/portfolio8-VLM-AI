@@ -1,0 +1,105 @@
+# VLM Screen Recognition - Default Configuration
+
+capture:
+  target_fps: 5.0
+  monitor: 0  # 0 = primary monitor
+  max_dimension: 1920  # downscale if larger
+
+change_detection:
+  phash_threshold: 16      # hamming distance (0-64), higher = more sensitive
+  ssim_threshold_major: 0.60  # below this = MAJOR change (0.50→0.60: ウィンドウ切替も捕捉)
+  ssim_threshold_moderate: 0.85  # below this = MODERATE
+  ssim_downscale: 256      # downscale to NxN for SSIM
+  periodic_interval: 40    # force small model every N idle frames
+  scene_cut_count: 5        # MAJOR changes within window to trigger scene cut
+  scene_cut_window: 5.0     # window in seconds for scene cut detection
+
+detection:
+  small_model: "yolo11m"   # YOLOv11 Medium: high accuracy
+  mid_model: "yolo11m"     # YOLOv11 Medium: high accuracy
+  confidence_threshold: 0.50
+  nms_threshold: 0.45
+  input_size: 640
+  min_box_area: 8000
+  class_whitelist:
+    - person
+    - laptop
+    - cell phone
+    - keyboard
+    - mouse
+    - chair
+    - cup
+    - bottle
+
+tracking:
+  tracker: "botsort"                        # tracker type
+  tracker_config: "config/botsort_reid.yaml" # custom BoT-SORT with Re-ID
+  min_hits: 5              # detections before track is confirmed (3→5)
+  max_entities: 100        # hard limit on simultaneous tracks
+
+analysis:
+  pose_model_complexity: 0       # 0=lite, 1=full, 2=heavy
+  pose_min_confidence: 0.5
+  expression_enabled: false      # DeepFace expression detection (expensive, ~20-100ms/entity)
+  expression_actions: ["emotion"]
+  skip_if_iou_above: 0.92       # skip re-analysis if barely moved
+  skip_if_frames_below: 8       # min frames between re-analysis
+
+predictive_coding:
+  enabled: true
+  diff_threshold: 25         # pixel intensity difference threshold (0-255)
+  min_region_area: 500       # minimum changed region area in pixels
+  morph_kernel_size: 5       # morphological cleanup kernel size
+  merge_distance: 30         # merge nearby regions within N pixels
+
+saliency:
+  enabled: true
+  top_k: 5                   # max number of salient regions to return
+  min_score: 0.3             # minimum saliency score (0-1)
+  min_region_area: 500       # minimum area for a salient region (pixels)
+  change_weight: 0.6         # weight for temporal change in combined score
+  spatial_weight: 0.4        # weight for spatial saliency in combined score
+
+optical_flow:
+  enabled: true
+  pyr_scale: 0.5             # Farneback pyramid scale
+  levels: 3                  # pyramid levels
+  winsize: 15                # averaging window size
+  iterations: 3              # iterations at each pyramid level
+  poly_n: 5                  # area of pixel neighborhood
+  poly_sigma: 1.2            # Gaussian standard deviation
+
+scene_graph:
+  enabled: true
+  near_threshold: 150        # max distance for "near" relation (pixels)
+  overlap_iou_threshold: 0.15  # min IoU for "overlapping" relation
+  containment_threshold: 0.7 # min overlap ratio for inside/contains
+
+working_memory:
+  enabled: true
+  memory_duration: 30.0      # seconds to remember lost entities
+  max_remembered: 50         # max remembered lost entities
+  reid_threshold: 0.6        # min histogram similarity for Re-ID
+  max_episodes: 100          # max episodic memory entries
+  hist_bins: 32              # color histogram bins per channel
+
+aggregation:
+  coordinate_precision: 5    # round to nearest N pixels
+  min_movement_threshold: 10 # ignore moves below N pixels
+  batch_frames: 1           # accumulate N frames before LLM call
+  max_tokens: 4000          # total token budget per LLM call
+  min_entity_lifetime: 12   # min frames_alive before reporting entity (8→12)
+
+narration:
+  model: "groq/meta-llama/llama-4-scout-17b-16e-instruct"
+  fallback_model: "groq/llama-3.3-70b-versatile"
+  min_interval_seconds: 1.0
+  max_context_entries: 3
+  max_crops: 2
+  crop_jpeg_quality: 70
+  send_screenshot: true
+  screenshot_max_dimension: 960
+  screenshot_jpeg_quality: 50
+
+device:
+  prefer: "auto"  # auto, cuda, directml, cpu

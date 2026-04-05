@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+venv/
+.venv/
+*.pt
+models/
+eve/
+vlm_orig/
+
+# 認証・個人データ
+vts_auth_token.txt
+conversation_history.txt
+memory_summary.txt
+rag_memory.jsonl
+
+# Claude内部設定
+.claude/
