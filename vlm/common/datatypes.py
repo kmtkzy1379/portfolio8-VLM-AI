@@ -162,8 +162,17 @@ class FrameDelta:
     frame_id: int
     timestamp_ms: float
     change_level: ChangeLevel
+    # Phase 2: Visual surprise proxy fields (NOT a neuroscientific prediction error;
+    # pixel-difference based approximation only).
+    change_magnitude_avg: float = 0.0   # Area-weighted mean of region change_magnitude (0-255).
+    change_magnitude_max: float = 0.0   # Max region change_magnitude (0-255).
+    n_regions: int = 0                  # Number of changed regions (proxy reliability indicator).
+    change_area_ratio: float = 0.0      # Sum of region area / total image pixels (0-1).
     scene_label: Optional[str] = None
     entity_deltas: list[EntityDelta] = field(default_factory=list)
+    # Phase 3.1: ScoredRegion list (saliency precision weighting source).
+    # Untyped on purpose to avoid circular import with vlm.capture.saliency.ScoredRegion.
+    scored_regions: list = field(default_factory=list)
 
 
 # ── Narration pipeline types ──
@@ -178,6 +187,31 @@ class NarrationRequest:
     screenshot: Optional[np.ndarray]
     frame_id: int
     is_reset: bool = False  # sentinel for scene cut
+
+
+# ── Phase 3 envelope ──
+
+
+@dataclass
+class NarrationResult:
+    """Phase 3 envelope: queue 経由で Eve 側に渡す構造化ナレーション結果。
+
+    Phase 1 の `(narration, change_level)` 2-tuple、Phase 2 の
+    `(narration, change_level, meta_dict)` 3-tuple から格上げ。
+    Bridge 側は legacy tuple / dict / NarrationResult のいずれも受信可能。
+    VLM 単体起動時の `_drain_narration_results` も NarrationResult を扱う。
+    """
+    narration: str = ""
+    change_level: ChangeLevel = ChangeLevel.NONE
+    meta: dict = field(default_factory=dict)
+    timestamp_ms: float = 0.0
+    frame_id: int = 0
+    type: str = "narration"
+    version: str = "v2"
+
+    def to_legacy_tuple(self) -> tuple:
+        """旧 _custom_drain (Phase 1/2) 互換形式に変換 (テスト用)。"""
+        return (self.narration, self.change_level, self.meta)
 
 
 # ── Token budget ──

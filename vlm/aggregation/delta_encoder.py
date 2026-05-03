@@ -50,6 +50,10 @@ class DeltaEncoder:
         change_level: ChangeLevel,
         scene_label: Optional[str] = None,
         timestamp_ms: float = 0.0,
+        change_magnitude_avg: float = 0.0,
+        change_magnitude_max: float = 0.0,
+        n_regions: int = 0,
+        change_area_ratio: float = 0.0,
     ) -> FrameDelta:
         """Compute deltas for all entities in current frame.
 
@@ -59,6 +63,11 @@ class DeltaEncoder:
             change_level: Change level from ChangeDetector.
             scene_label: Optional scene classification.
             timestamp_ms: Capture timestamp in milliseconds (monotonic clock).
+            change_magnitude_avg: Area-weighted mean of region change_magnitude (0-255).
+                Visual surprise proxy; not a true neuroscientific prediction error.
+            change_magnitude_max: Max region change_magnitude (0-255).
+            n_regions: Number of changed regions in this frame.
+            change_area_ratio: Sum of region area / total image pixels (0-1).
 
         Returns:
             FrameDelta with only changed information.
@@ -127,6 +136,10 @@ class DeltaEncoder:
             frame_id=tracking_state.frame_id,
             timestamp_ms=timestamp_ms,
             change_level=change_level,
+            change_magnitude_avg=change_magnitude_avg,
+            change_magnitude_max=change_magnitude_max,
+            n_regions=n_regions,
+            change_area_ratio=change_area_ratio,
             scene_label=scene_label,
             entity_deltas=deltas,
         )

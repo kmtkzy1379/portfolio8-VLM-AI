@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import os
+from typing import Optional
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 from config import Config
@@ -281,6 +283,45 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         self._vlm_bridge = None
         self._vision_tools_enabled = False
 
+        # Phase 4.3.3 (Batch 2): Goal Slot 二層 — in-memory が SoT、goal.txt は永続化補助
+        self.goal_file = Config.GOAL_FILE
+        self.current_goal_slot: Optional[dict] = None
+        self._load_goal_slot_from_file()
+
+    def set_goal_slot(self, goal_dict: dict) -> None:
+        """Phase 4.3.3: FeedbackHandler から goal 更新通知を受けて in-memory + goal.txt に永続化。
+
+        in-memory (`self.current_goal_slot`) が SoT。goal.txt は restore/persistence 補助。
+        Windows 安全な os.replace() による atomic write。
+        """
+        self.current_goal_slot = goal_dict
+        try:
+            tmp = self.goal_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(goal_dict, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.goal_file)
+        except Exception as e:
+            logger.warning("[LLM] goal.txt write failed: %s", e)
+
+    def _load_goal_slot_from_file(self) -> None:
+        """起動時 1 回のみ呼ばれる。ファイル不在 / 破損は cold-start (None) で運転継続。"""
+        if not os.path.exists(self.goal_file):
+            return
+        try:
+            with open(self.goal_file, "r", encoding="utf-8") as f:
+                self.current_goal_slot = json.load(f)
+            if isinstance(self.current_goal_slot, dict):
+                logger.info(
+                    "[LLM] goal slot restored from %s: short=%s",
+                    self.goal_file,
+                    self.current_goal_slot.get("goal_short", "?"),
+                )
+            else:
+                self.current_goal_slot = None
+        except Exception as e:
+            logger.warning("[LLM] goal.txt load failed: %s", e)
+            self.current_goal_slot = None
+
     def set_vision_components(self, vlm_bridge) -> None:
         """VLMBridgeを設定/解除してFunction Callingを有効化/無効化"""
         self._vlm_bridge = vlm_bridge
@@ -292,15 +333,36 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # AI2フィードバックコンテキスト
         ai2_context = ""
         if self.ai2_feedback:
-            ai2_context = f"\n[AI2 Self-Feedback]:\n{self.ai2_feedback}\n"
+            ai2_context = (
+                "\n[AI2 Self-Feedback — あなたの内省AIが直前に生成した指針。"
+                "特に『次の推奨行動』『一貫した行動目標』を優先して振る舞え]:\n"
+                f"{self.ai2_feedback}\n"
+            )
 
-        # RAG記憶コンテキスト
+        # RAG記憶コンテキスト (Phase 4.3.1: type 別分岐対応)
         rag_context = ""
         if hasattr(self, "rag_memories") and self.rag_memories:
             rag_context = "\n[Long-term Memory from RAG]:\n"
             for i, memory in enumerate(self.rag_memories, 1):
-                rag_context += f"{i}. User: {memory.get('user', '')}\n"
-                rag_context += f"   AI: {memory.get('ai', '')}\n"
+                t = memory.get("type", "legacy_turn")
+                if t == "episode":
+                    tags = memory.get("topic_tags", [])
+                    tags_str = f" (tags: {', '.join(tags)})" if tags else ""
+                    summary = memory.get("summary", "")
+                    rag_context += f"{i}. [Episode] {summary}{tags_str}\n"
+                elif t == "goal":
+                    short = memory.get("summary", "")
+                    long_ = memory.get("goal_long", "")
+                    rag_context += f"{i}. [Past goal] {short}"
+                    if long_ and long_ != "維持":
+                        rag_context += f" — {long_}"
+                    rag_context += "\n"
+                else:  # legacy_turn (type 無し旧 entry も含む)
+                    user_text = memory.get("user", "")
+                    ai_text = memory.get("ai", "")
+                    if user_text or ai_text:
+                        rag_context += f"{i}. User: {user_text}\n"
+                        rag_context += f"   AI: {ai_text}\n"
             rag_context += "\n"
 
         # 直近5ターン
@@ -347,12 +409,29 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 "- 毎回使う必要はない。監視の依頼/解除の時だけ使う。\n"
             )
 
+        # Phase 4.3.3 (Batch 2): Goal Slot を「# Start Conversation」直前に注入
+        # Lost in the Middle (Liu et al. 2023) 対応で末尾近くに配置 → attention が強い位置
+        goal_block = ""
+        if self.current_goal_slot:
+            gs = self.current_goal_slot.get("goal_short", "")
+            gl = self.current_goal_slot.get("goal_long", "")
+            if gs:
+                goal_block = (
+                    "\n[現在の目的 — 行動の最優先指針]:\n"
+                    f"  {gs}\n"
+                )
+                if gl:
+                    goal_block += f"[長期方針]: {gl}\n"
+
         # 組み立て
         base_content = self.system_prompt
         if "# Start Conversation" in base_content:
             base_content = base_content.split("# Start Conversation")[0].rstrip()
 
-        combined = ai2_context + vlm_context_str + vision_hint + rag_context + recent_context
+        combined = (
+            ai2_context + vlm_context_str + vision_hint
+            + rag_context + recent_context + goal_block
+        )
         return (
             base_content + combined +
             "\n# Start Conversation\n以上の設定と記憶をロードしました。"

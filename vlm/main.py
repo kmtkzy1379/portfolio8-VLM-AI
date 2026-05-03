@@ -29,7 +29,13 @@ from vlm.capture.predictive_coder import PredictiveCoder
 from vlm.capture.saliency import SaliencyDetector
 from vlm.capture.screen import ScreenCapture
 from vlm.common.config import get_nested, load_config
-from vlm.common.datatypes import ChangeLevel, EntityFeatures, FrameDelta, NarrationRequest
+from vlm.common.datatypes import (
+    ChangeLevel,
+    EntityFeatures,
+    FrameDelta,
+    NarrationRequest,
+    NarrationResult,
+)
 from vlm.common.device import detect_device
 from vlm.detection.yolo_detector import YOLODetector
 from vlm.narration.llm_client import NarrationEngine
@@ -86,6 +92,11 @@ class Pipeline:
         self._rapid_change_window_start = 0.0
         self._frames_since_narration = 0
         self._accumulated_deltas: list[FrameDelta] = []
+
+        # Phase 3.1: structured counts accumulation (Hierarchical surprise の入力用)
+        self._accum_rel_added: int = 0
+        self._accum_rel_removed: int = 0
+        self._accum_episodes_baseline: int = 0  # 前回 narration 時点の episode 数
 
         # Threading state
         self._stop_event = threading.Event()
@@ -276,7 +287,114 @@ class Pipeline:
                         if d.change_level.value > max_change.value:
                             max_change = d.change_level
 
-                    result = (narration, max_change)
+                    # Phase 2: Build versioned envelope of structured metadata
+                    # for downstream FEP-inspired feedback (Eve side).
+                    # change_magnitude_* are visual surprise proxies, not true
+                    # neuroscientific prediction errors.
+                    if request.deltas:
+                        avg_mags = [d.change_magnitude_avg for d in request.deltas]
+                        max_mags = [d.change_magnitude_max for d in request.deltas]
+                        n_regs_list = [d.n_regions for d in request.deltas]
+                        ratios = [d.change_area_ratio for d in request.deltas]
+                        period_avg = sum(avg_mags) / len(avg_mags)
+                        period_max = max(max_mags)
+                        period_n_regs_max = max(n_regs_list)
+                        period_area_ratio_max = max(ratios)
+                    else:
+                        period_avg = period_max = 0.0
+                        period_n_regs_max = 0
+                        period_area_ratio_max = 0.0
+
+                    # Phase 3.1: Saliency-weighted aggregation
+                    # NOTE: change_score > 0 の region のみで重み付き平均を取る。
+                    # salient-only region (change_score=0) を含めると静的 UI の
+                    # saliency が分母に効いて avg が不自然に下がるため除外。
+                    all_scored: list = []
+                    for d in request.deltas:
+                        if d.scored_regions:
+                            all_scored.extend(d.scored_regions)
+                    movers = [sr for sr in all_scored if sr.change_score > 0.0]
+                    if movers:
+                        total_w = sum(sr.w * sr.h * sr.saliency_score for sr in movers)
+                        if total_w > 0:
+                            sw_avg = sum(
+                                (sr.change_score * 255.0) * sr.w * sr.h * sr.saliency_score
+                                for sr in movers
+                            ) / total_w
+                        else:
+                            sw_avg = 0.0
+                        sw_max = max(sr.change_score * 255.0 for sr in movers)
+                    else:
+                        sw_avg = sw_max = 0.0
+
+                    # Top Salient Regions は全 region (静的含む) で combined_score 降順
+                    top_5 = sorted(
+                        all_scored, key=lambda sr: sr.combined_score, reverse=True
+                    )[:5]
+                    top_salient = [
+                        {
+                            "bbox": [sr.x, sr.y, sr.w, sr.h],
+                            "saliency": round(sr.saliency_score, 3),
+                            "change": round(sr.change_score, 3),
+                            "combined": round(sr.combined_score, 3),
+                            "is_static": sr.change_score == 0.0,
+                        }
+                        for sr in top_5
+                    ]
+
+                    # Phase 3.1: Structured counts (Phase 3.2 hierarchical surprise の入力用)
+                    n_entity_new = sum(
+                        1 for d in request.deltas for ed in d.entity_deltas if ed.is_new
+                    )
+                    n_entity_lost = sum(
+                        1 for d in request.deltas for ed in d.entity_deltas if ed.is_lost
+                    )
+                    n_entity_changed = sum(
+                        1 for d in request.deltas for ed in d.entity_deltas
+                        if not ed.is_new and not ed.is_lost
+                    )
+                    # Episode count: 前回 narration 以降の追加分
+                    current_episode_total = len(self._working_memory._episodes)
+                    n_new_episodes = max(
+                        0, current_episode_total - self._accum_episodes_baseline
+                    )
+
+                    meta = {
+                        "version": "v2",
+                        # Phase 2 v1 fields (互換)
+                        "change_magnitude_avg": period_avg,
+                        "change_magnitude_max": period_max,
+                        "n_regions_max": period_n_regs_max,
+                        "change_area_ratio_max": period_area_ratio_max,
+                        "relations_text": request.relations_text or "",
+                        "memory_text": request.memory_text or "",
+                        "entity_delta_text": self._delta_encoder.to_temporal_text(
+                            request.deltas
+                        ),
+                        "n_deltas": len(request.deltas),
+                        "frame_id": request.frame_id,
+                        # Phase 3.1 v2: saliency precision weighting
+                        "saliency_weighted_avg": sw_avg,
+                        "saliency_weighted_max": sw_max,
+                        "top_salient_regions": top_salient,
+                        "n_movers": len(movers),
+                        # Phase 3.1 v2: structured counts (hierarchical surprise input)
+                        "change_level_name": max_change.name,
+                        "n_entity_new": n_entity_new,
+                        "n_entity_lost": n_entity_lost,
+                        "n_entity_changed": n_entity_changed,
+                        "n_relation_added": self._accum_rel_added,
+                        "n_relation_removed": self._accum_rel_removed,
+                        "n_memory_episodes": n_new_episodes,
+                    }
+
+                    result = NarrationResult(
+                        narration=narration,
+                        change_level=max_change,
+                        meta=meta,
+                        timestamp_ms=request.deltas[-1].timestamp_ms if request.deltas else 0.0,
+                        frame_id=request.frame_id,
+                    )
                     try:
                         self._narration_result_queue.put_nowait(result)
                     except queue.Full:
@@ -289,6 +407,11 @@ class Pipeline:
                             self._narration_result_queue.put_nowait(result)
                         except queue.Full:
                             pass
+
+                    # Phase 3.1: 累積カウンタをリセット
+                    self._accum_rel_added = 0
+                    self._accum_rel_removed = 0
+                    self._accum_episodes_baseline = current_episode_total
         except Exception:
             logger.exception("LLM thread error")
         finally:
@@ -348,6 +471,29 @@ class Pipeline:
 
                 # V2: Compute change regions (WHERE changed)
                 change_regions = self._predictive_coder.compute_change_regions(frame.image)
+
+                # Phase 2: Aggregate visual surprise proxy from change regions.
+                # NOTE: change_magnitude is a pixel-difference proxy, NOT a true
+                # neuroscientific prediction error. Use area-weighted mean for
+                # robustness against camera shake / lighting variations.
+                if change_regions:
+                    total_area = sum(r.area for r in change_regions)
+                    if total_area > 0:
+                        cm_avg = (
+                            sum(r.change_magnitude * r.area for r in change_regions)
+                            / total_area
+                        )
+                    else:
+                        cm_avg = 0.0
+                    cm_max = max(r.change_magnitude for r in change_regions)
+                    n_regs = len(change_regions)
+                    h, w = frame.image.shape[:2]
+                    total_pixels = max(h * w, 1)
+                    area_ratio = total_area / total_pixels
+                else:
+                    cm_avg = cm_max = 0.0
+                    n_regs = 0
+                    area_ratio = 0.0
 
                 # V1: Combine with saliency (WHAT is prominent)
                 scored_regions = self._saliency.combine_with_changes(
@@ -431,7 +577,18 @@ class Pipeline:
                 delta = self._delta_encoder.encode(
                     tracking_state, features, change_level,
                     timestamp_ms=frame.metadata.timestamp_ms,
+                    change_magnitude_avg=cm_avg,
+                    change_magnitude_max=cm_max,
+                    n_regions=n_regs,
+                    change_area_ratio=area_ratio,
                 )
+
+                # Phase 3.1: ScoredRegion を delta に格納 (Saliency precision weighting source)
+                delta.scored_regions = list(scored_regions)
+
+                # Phase 3.1: 期間内の関係増減を累積 (NarrationRequest 送信時にリセット)
+                self._accum_rel_added += len(rel_added)
+                self._accum_rel_removed += len(rel_removed)
 
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -514,17 +671,28 @@ class Pipeline:
         return self._rapid_change_count >= self._scene_cut_count
 
     def _drain_narration_results(self) -> None:
-        """Non-blocking drain of completed narration results."""
+        """Non-blocking drain of completed narration results.
+
+        Phase 3: result は NarrationResult dataclass、dict envelope、
+        legacy tuple (Phase 1/2) のいずれも受け付ける。VLM 単体起動時
+        (このメソッドが直接 narration を表示する場合) のクラッシュ回避。
+        """
         while True:
             try:
                 result = self._narration_result_queue.get_nowait()
             except queue.Empty:
                 break
-            # Result is (narration, change_level) tuple
-            if isinstance(result, tuple):
-                narration, change_level = result
+            if isinstance(result, NarrationResult):
+                narration = result.narration
+            elif isinstance(result, dict):
+                narration = result.get("narration", "")
+            elif isinstance(result, tuple):
+                if len(result) >= 1:
+                    narration = result[0]
+                else:
+                    narration = ""
             else:
-                narration = result
+                narration = str(result)
             print(f"\n{'='*60}")
             print("[LLM Narration]")
             print(narration)

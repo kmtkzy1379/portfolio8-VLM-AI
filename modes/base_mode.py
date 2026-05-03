@@ -68,13 +68,15 @@ class BaseMode(ABC):
 
         # AI2フィードバック用のコールバック設定
         def update_memory_func(memory_text):
-            self.llm.ai2_feedback = memory_text[:500]
-            self.log("System", "AI2 Feedback Updated")
+            self.llm.ai2_feedback = memory_text[:Config.FB_LOOP_MAX_CHARS]
+            self.log("System", f"AI2 Feedback Updated ({len(memory_text)} chars)")
         self.llm.update_memory = update_memory_func
         self.llm.rag = self.rag
 
-        # FeedbackHandler初期化
-        self.feedback = FeedbackHandler(self.llm)
+        # FeedbackHandler初期化 (ループ型FEPメタ認知)
+        self.feedback = FeedbackHandler(self.llm, conversation_cache=self.conversation_cache)
+        # Phase 4.3.1: feedback ループから episode を RAG へ保存できるよう注入
+        self.feedback.set_rag(self.rag)
 
         # RAGと会話キャッシュを初期化
         await self.rag.initialize()
@@ -108,6 +110,13 @@ class BaseMode(ABC):
             try:
                 await self._player_task
             except asyncio.CancelledError:
+                pass
+
+        # フィードバックループは停止要求を先に出し、進行中の LLM 呼出を中断しない
+        if self.feedback:
+            try:
+                await self.feedback.stop()
+            except Exception:
                 pass
 
         if self._feedback_task:
@@ -150,7 +159,9 @@ class BaseMode(ABC):
             # RAG検索（800msタイムアウト）
             rag_memories = []
             try:
-                rag_task = asyncio.create_task(self.rag.search_similar(input_text, top_k=2))
+                # Phase 4.3.2: top_k は Config.FB_RAG_TOP_K (default 4) を使う
+                # MMR による多様性確保が効くため top_k 拡大しても重複しない
+                rag_task = asyncio.create_task(self.rag.search_similar(input_text))
                 rag_memories = await asyncio.wait_for(rag_task, timeout=1.5)
                 if rag_memories:
                     self.log("System", f"RAG found: {len(rag_memories)} memories")
@@ -203,10 +214,13 @@ class BaseMode(ABC):
             if ai_response:
                 self.log("AI", ai_response)
                 await self.conversation_cache.add_ai_response(ai_response)
-                await self.rag.add_turn(input_text, ai_response)
+                # Phase 4.3.1: 生ターン保存は撤去。
+                # RAG 入力は feedback ループが Episode Summary 経由で行う (rag.add_episode)。
+                # conversation_history.txt は別途 cache 経由で監査用に蓄積される。
 
-            # フィードバック処理をトリガー
-            asyncio.create_task(self.feedback.process_pending())
+            # フィードバックループに「ターン完了」シグナルを送る (Event.set のみ、同期・即時)
+            if self.feedback:
+                self.feedback.signal_turn_done()
 
             total_time = time.time() - start_time
             self.log("System", f"Response time: {total_time*1000:.1f}ms")
@@ -247,6 +261,10 @@ class BaseMode(ABC):
             if hasattr(self.llm, 'set_vision_components'):
                 self.llm.set_vision_components(bridge)
 
+        # フィードバックループにも同じ bridge を共有 (VLM フレームを取り込むため)
+        if self.feedback is not None:
+            self.feedback.set_vlm_bridge(bridge)
+
     def _on_vision_auto_push(self, vision_frame) -> None:
         """VLMBridge auto-push callback (called from VLM thread).
 
@@ -282,6 +300,10 @@ class BaseMode(ABC):
             self.llm.vlm_context = f"{alert}\n{existing}"[:800]
 
         self.log("System", f"Vision nudge: {alert[:100]}...")
+
+        # フィードバックループに VLM イベント通知 (即ウェイク)
+        if self.feedback:
+            self.feedback.signal_vlm_event()
 
         await self.process_input(
             f"[内部: 画面変化通知 - 前回と本当に違う場合のみリアクション] {vision_frame.narration[:200]}"

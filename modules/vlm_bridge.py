@@ -7,6 +7,7 @@ from a separate thread, suitable for integration with Eve's asyncio-based modes.
 ルールベース分類: VLMパイプラインのchange_levelで分類し、
 応答AIにタグ付きコンテキストを渡す。ImportanceAI不要。
 """
+import dataclasses
 import difflib
 import io
 import logging
@@ -18,9 +19,62 @@ from typing import Callable, Optional
 from PIL import Image
 
 from config import Config
-from modules.vision_buffer import VisionBuffer, VisionFrame
+from modules.vision_buffer import VisionBuffer, VisionFrame, VisionMeta
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3.1: Compat helpers for queue result normalization
+# ──────────────────────────────────────────────────────────────────────
+
+def _normalize_result(result):
+    """legacy tuple (Phase 1/2) / dict / NarrationResult を統一形式に正規化する。
+
+    Returns:
+        (narration: str, change_level, meta_dict | None)
+    """
+    # NarrationResult dataclass (Phase 3) — duck-type で属性チェック
+    if hasattr(result, "narration") and hasattr(result, "change_level") and hasattr(result, "meta"):
+        return result.narration, result.change_level, result.meta
+    if isinstance(result, dict):
+        return (
+            result.get("narration", ""),
+            result.get("change_level"),
+            result.get("meta", {}) or None,
+        )
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            return result[0], result[1], result[2]
+        if len(result) == 2:
+            return result[0], result[1], None
+        return (result[0] if result else ""), None, None
+    return result, None, None
+
+
+def _safe_construct_vision_meta(meta_dict: dict) -> Optional[VisionMeta]:
+    """meta_dict から VisionMeta を安全構築する。
+
+    `dataclasses.fields(VisionMeta)` で許可フィールドだけを通し、
+    未知フィールドは log で warn して drop する (silent failure 回避)。
+    """
+    if not isinstance(meta_dict, dict):
+        return None
+    allowed = {f.name for f in dataclasses.fields(VisionMeta)}
+    filtered: dict = {}
+    unknown: list = []
+    for k, v in meta_dict.items():
+        if k in allowed:
+            filtered[k] = v
+        else:
+            unknown.append(k)
+    if unknown:
+        logger.warning("VisionMeta: dropping unknown fields: %s", unknown)
+    try:
+        return VisionMeta(**filtered)
+    except TypeError as e:
+        logger.warning("VisionMeta construction failed: %s", e)
+        return None
 
 
 class VLMBridge:
@@ -300,10 +354,17 @@ class VLMBridge:
             except queue.Empty:
                 break
 
-            if isinstance(result, tuple):
-                narration, change_level = result
-            else:
-                narration, change_level = result, None
+            # Phase 3.1: NarrationResult / dict / legacy tuple すべて受信
+            narration, change_level, meta_dict = _normalize_result(result)
+
+            # Build VisionMeta from envelope. Reject silently-broken payloads.
+            meta_obj = None
+            if meta_dict and isinstance(meta_dict, dict):
+                version = meta_dict.get("version", "v0")
+                if version in ("v1", "v2"):
+                    meta_obj = _safe_construct_vision_meta(meta_dict)
+                else:
+                    logger.warning("Unknown VisionMeta envelope version: %s", version)
 
             with self._lock:
                 self._latest_narration = narration
@@ -319,6 +380,7 @@ class VLMBridge:
                 screenshot=screenshot_jpeg,
                 change_tag=tag,
                 reason=f"change_level={change_level}",
+                meta=meta_obj,
             )
             self.vision_buffer.add(frame)
             self._log("VLM", f"[{tag}] {narration}")

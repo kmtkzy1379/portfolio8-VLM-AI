@@ -14,6 +14,8 @@ vts_auth_token.txt
 conversation_history.txt
 memory_summary.txt
 rag_memory.jsonl
+goal.txt
+precision_history.jsonl
 
 # Claude内部設定
 .claude/
