@@ -1,56 +1,57 @@
 # ===== Eve + VLM Merged Dependencies =====
 
 # Core
-python-dotenv==1.1.0
+python-dotenv==1.2.2
 colorama==0.4.6
-PyYAML==6.0.2
+PyYAML==6.0.3
 
 # AI / LLM (Eve)
-groq==0.36.0
-openai>=2.8.0
-anthropic>=0.40.0
+groq==1.2.0
+openai==2.35.1
+anthropic==0.100.0
 
 # AI / LLM (VLM)
-litellm>=1.82.3
-tiktoken==0.9.0
+litellm==1.83.14
+tiktoken==0.12.0
 
 # Audio
 PyAudio==0.2.14
 soundfile==0.13.1
 
 # ML / Torch
-torch==2.9.1
-torchaudio==2.9.1
-numpy==2.2.5
+torch==2.11.0
+torchaudio==2.11.0
+numpy==2.4.4
 
 # Image / Screen Capture (shared)
 opencv-python-headless==4.13.0.92
-Pillow==11.2.1
-mss==10.0.0
+Pillow==12.2.0
+mss==10.2.0
 
 # VLM - Change Detection
 ImageHash==4.3.2
 scikit-image==0.26.0
 
 # VLM - Detection & Tracking
-ultralytics==8.4.19
-onnxruntime==1.21.1
-supervision==0.27.0.post1
+ultralytics==8.4.47
+onnxruntime==1.25.1
+supervision==0.28.0
 
 # VLM - Analysis
-mediapipe==0.10.32
+mediapipe==0.10.35
 deepface==0.0.99
-tf-keras
+tf-keras==2.21.0
 
 # Input
 keyboard==0.13.5
 
 # HTTP
-aiohttp==3.11.18
-requests>=2.31.0
+aiohttp==3.13.5
+requests==2.33.1
 
 # YouTube API
-google-api-python-client==2.167.0
+google-api-python-client==2.196.0
 
 # VTube Studio Connection
-websockets==14.1
+websockets==16.0
+
