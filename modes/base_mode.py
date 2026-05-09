@@ -171,9 +171,21 @@ class BaseMode(ABC):
                 self.log("System", f"RAG Error: {e}")
 
             # RAGと直近ターンをLLMに設定
+            # exclude_ellipsis=True: 内部見守り発話「…」を recent_turns から除外
+            #   (沈黙時に直前の実会話が押し出される問題への対策)
             self.llm.rag_memories = rag_memories
-            recent_turns = await self.conversation_cache.get_recent_turns(count=5)
+            recent_turns = await self.conversation_cache.get_recent_turns(
+                count=5, exclude_ellipsis=True,
+            )
             self.llm.recent_turns = recent_turns
+            # 沈黙サマリ (「…」除外で失われた情報を別経路で AI1 に渡す)
+            try:
+                self.llm.silence_summary = (
+                    await self.conversation_cache.get_silence_summary()
+                )
+            except Exception as e:
+                self.log("System", f"silence_summary failed: {e}")
+                self.llm.silence_summary = None
 
             # VLM screen recognition context
             if self.vlm_bridge and self.vlm_bridge.is_running:

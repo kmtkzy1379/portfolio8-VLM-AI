@@ -117,6 +117,12 @@ _GOAL_BOILERPLATE_PHRASES = [
     "対話の具体性を高める", "長期的かつ良好",
 ]
 
+# AI1 注入用「応答AIへの内省ノート」セクション抽出 (regex)
+_AI1_NOTE_SECTION_RE = re.compile(
+    r"応答AIへの内省ノート.*",
+    re.DOTALL,
+)
+
 
 @dataclass
 class _Window:
@@ -169,6 +175,9 @@ class FeedbackHandler:
         self._last_run_monotonic = 0.0
         self._last_activity = "low"  # "high" / "mid" / "low"
         self._prev_feedback_head = ""
+        # Phase 2.4: 前回 AI2 出力から抽出した「応答AIへの内省ノート」本文。
+        # 次回ループで AI2 に「覚えておくこと」を継承させるため user_text に渡す。
+        self._prev_ai1_note: str = ""
         self._start_time: Optional[datetime] = None
         # Phase 2: silence streak counter for the silent prompt
         self._silence_streak: int = 0
@@ -201,6 +210,8 @@ class FeedbackHandler:
         # _boilerplate_embedding: lazy 初期化される (本検出 2 用)
         self._goal_short_history: deque = deque(maxlen=Config.FB_GOAL_HISTORY_SIZE)
         self._goal_quality_warn: Optional[str] = None
+        # 前ループの goal_short 文字列。完全同一 (内省していない) を検出するための比較用
+        self._last_goal_short_text: Optional[str] = None
         self._boilerplate_embedding: Optional[list] = None
 
         # Phase 4.3.4 (Batch 3): Self-Evaluation Bias Detection
@@ -257,6 +268,8 @@ class FeedbackHandler:
         last_fb, last_preds = self._load_last_feedback()
         if last_fb:
             self._prev_feedback_head = last_fb[:400]
+            # Phase 2.4: 前回内省ノート本文を復元 (次回ループで AI2 に継承を促す)
+            self._prev_ai1_note = self._extract_ai1_note(last_fb) or ""
             self._inject_to_llm(last_fb)
         if last_preds:
             # Phase 4.1: 前回予測を復元 → 起動後最初のループで比較ブロックが現れる
@@ -447,6 +460,7 @@ class FeedbackHandler:
                 prev_feedback_head=self._prev_feedback_head,
                 vlm_block=silent_vlm_block,
                 action_context_lite=action_ctx_silent,
+                prev_ai1_note=self._prev_ai1_note,  # Phase 2.4: 世代継承
             )
         else:
             self._last_activity = "high" if window.n_turns > 0 else "mid"
@@ -466,6 +480,16 @@ class FeedbackHandler:
                 self._last_evaluation_for_narrative,
                 self._silence_streak,
             )
+            # 沈黙サマリ (recent_turns から「…」を除外したことに対応)
+            silence_sec = 0.0
+            ellipsis_cnt = 0
+            if self.conversation_cache is not None:
+                try:
+                    sil = await self.conversation_cache.get_silence_summary()
+                    silence_sec = float(sil.get("silence_seconds") or 0.0)
+                    ellipsis_cnt = int(sil.get("ellipsis_count") or 0)
+                except Exception as e:
+                    logger.warning("[Feedback] silence_summary failed: %s", e)
             user_text = build_fep_user_text(
                 window_start=(self._cutoff_ts or self._start_time or window_end).isoformat(timespec="seconds"),
                 window_end=window_end.isoformat(timespec="seconds"),
@@ -478,6 +502,9 @@ class FeedbackHandler:
                 action_context=action_ctx,
                 prev_prediction_block=prev_prediction_block,
                 precision_block=precision_block,
+                silence_seconds=silence_sec,
+                ellipsis_count=ellipsis_cnt,
+                prev_ai1_note=self._prev_ai1_note,  # Phase 2.4: 世代継承
             )
 
         # Phase 2/3: surface visual surprise proxy stats + hierarchical + action_ctx in the loop log
@@ -602,6 +629,16 @@ class FeedbackHandler:
                 )
             except Exception as e:
                 logger.warning("[Feedback][Goal] quality check failed: %s", e)
+            # 1.5) 完全同一の goal_short が連続したら劣化警告に追記 (内省していないシグナル)
+            #      keep 自体は許容するが、文字列を一切動かさない keep は形骸化の指標
+            if (
+                self._last_goal_short_text
+                and new_goal.get("goal_short") == self._last_goal_short_text
+            ):
+                suffix = "前回と完全同一の goal_short (内省していない可能性)"
+                goal_warn = f"{goal_warn} | {suffix}" if goal_warn else suffix
+            # 次ループ比較用に記録 (extraction 成功時のみ)
+            self._last_goal_short_text = new_goal.get("goal_short")
             # 2) SoT 更新: in-memory + goal.txt atomic write (set_goal_slot 内)
             if hasattr(self.llm_handler, "set_goal_slot"):
                 try:
@@ -650,6 +687,8 @@ class FeedbackHandler:
             self._self_eval_bias_warn = None
 
         self._prev_feedback_head = result[:400]
+        # Phase 2.4: 次回ループ用に AI1 内省ノートも保持 (世代継承)
+        self._prev_ai1_note = self._extract_ai1_note(result) or ""
         # Phase 4.1: 状態更新 — silent パスは _prev_predictions を消費せず保留 (上で処理済み)。
         # 非 silent パスでは新予測に置き換え + 保留カウンタリセット。
         if not window.is_silent:
@@ -784,21 +823,34 @@ class FeedbackHandler:
     # ------------------------------------------------------------------
     @staticmethod
     def _format_dialog_log(entries: list[dict]) -> str:
+        """対話ログを整形。
+
+        Phase 2.1: 内部見守り発話「…」のエントリは AI2 に見せない。
+        沈黙の事実は build_fep_user_text の【沈黙状況】ブロックで別途渡されるため、
+        ログ本文に「…」を残すと LLM が「直前は…と返した」と誤分析する原因になる。
+        """
         if not entries:
             return ""
         lines: list[str] = []
         for e in entries:
+            user_text = e.get("user", "")
+            ai_text = e.get("ai", "")
+            # 「…」は機械沈黙イベントなのでログから除外
+            if "user" in e and user_text.strip() == "…":
+                continue
+            if "ai" in e and ai_text.strip() == "…":
+                continue
             ts = e.get("timestamp", "")
             try:
                 t = datetime.fromisoformat(ts).strftime("%H:%M:%S") if ts else ""
             except Exception:
                 t = ""
-            if "user" in e and e.get("user"):
+            if "user" in e and user_text:
                 prefix = f"[{t}] " if t else ""
-                lines.append(f"{prefix}User: {e['user']}")
-            elif "ai" in e and e.get("ai"):
+                lines.append(f"{prefix}User: {user_text}")
+            elif "ai" in e and ai_text:
                 prefix = f"[{t}] " if t else ""
-                lines.append(f"{prefix}AI: {e['ai']}")
+                lines.append(f"{prefix}AI: {ai_text}")
         return "\n".join(lines)
 
     @staticmethod
@@ -1035,6 +1087,10 @@ class FeedbackHandler:
         """conversation_history.txt 末尾から user/AI ペアを最大 n 組取って整形する。
 
         無言プロンプト用に、沈黙に入る直前の対話を文脈として注入するためのもの。
+
+        Phase 2.2: 「…」だけのペア (user=='…' かつ ai=='…' or ai 不在) はスキップし、
+        n は実会話ペアでカウントする。これにより長期沈黙時に AI2 が真の
+        「沈黙開始前の最後の実会話 n ペア」を読めるようにする。
         """
         if n <= 0:
             return ""
@@ -1059,6 +1115,18 @@ class FeedbackHandler:
                 i -= 1
             else:
                 i -= 1
+                continue
+            # 「…」だけのペアはスキップ (沈黙イベントは別経路で AI2 に渡る)
+            is_ellipsis_user = (
+                user_entry is not None
+                and user_entry.get("user", "").strip() == "…"
+            )
+            is_ellipsis_ai = (
+                ai_entry is not None
+                and ai_entry.get("ai", "").strip() == "…"
+            )
+            if is_ellipsis_user and (ai_entry is None or is_ellipsis_ai):
+                continue
             if user_entry or ai_entry:
                 pairs.append((user_entry, ai_entry))
         pairs.reverse()
@@ -1346,6 +1414,28 @@ class FeedbackHandler:
         extracted.setdefault("goal_long", "維持")
         extracted["extracted_at"] = datetime.now().isoformat()
         return extracted
+
+    @staticmethod
+    def _extract_ai1_note(feedback_text: str) -> Optional[str]:
+        """LLM 出力の「■ 応答AIへの内省ノート」セクションを抽出 (AI1 注入用)。
+
+        成功時: 見出し行 (「応答AIへの内省ノート ...」) を除いた本文を返す。
+        失敗時 (セクション欠如・空) は None。
+        """
+        m = _AI1_NOTE_SECTION_RE.search(feedback_text)
+        if not m:
+            return None
+        section = m.group(0)
+        # 後続セクション (■ 〜) で切る
+        cut = re.search(r"\n■", section[1:])
+        if cut:
+            section = section[: 1 + cut.start()]
+        # 1 行目 (見出し行) を削除して本文だけ返す
+        lines = section.splitlines()
+        if lines:
+            lines = lines[1:]
+        body = "\n".join(lines).strip()
+        return body if body else None
 
     async def _check_goal_quality(self, goal_short: str) -> Optional[str]:
         """3 段階検証で劣化フラグの文言を返す。立たなければ None。
@@ -1640,12 +1730,19 @@ class FeedbackHandler:
             )
 
         # Phase 4.3.3 (Batch 2): 前ループで検出された Goal 劣化フラグの警告ブロック
+        # 改訂: 命令調 (「書き直せ」) ではなく再審査要求に変更し、keep の選択肢を明示する。
+        # これにより安定した目標まで update/pivot に揺らぐ問題を抑制する。
         goal_warn_block = ""
         if self._goal_quality_warn:
             goal_warn_block = (
-                "\n  【Goal 劣化警告 (Phase 4.3.3)】\n"
-                f"  - 前ループの goal_short に問題: {self._goal_quality_warn}\n"
-                "  - 今回は **必ず別表現** で書き直せ。固有名詞・具体行動を含む短文に。\n"
+                "\n  【Goal 再審査要求 (Phase 4.3.3)】\n"
+                f"  - 前ループの goal_short に劣化シグナル: {self._goal_quality_warn}\n"
+                "  - これは「変えろ」ではなく「再審査せよ」。次のいずれかを選び理由を書け:\n"
+                "    (a) keep: 芯は同じだが、goal_short の表現と焦点を直近観測に合わせて具体化する\n"
+                "    (b) update: 話題が動いたので軸を更新する\n"
+                "    (c) pivot: 方向転換が起きた\n"
+                "  - keep を選ぶなら、なぜ keep が妥当か直近観測ベースの理由を 1 文添えること。\n"
+                "  - 完全に同一の goal_short 文字列は「内省していない」シグナルとして扱われる。\n"
                 "  - 「維持」「良好な共存」「対話の具体性を高める」など決まり文句の言い直しは禁止。\n"
             )
 
@@ -1860,8 +1957,15 @@ class FeedbackHandler:
     # Inject into response LLM
     # ------------------------------------------------------------------
     def _inject_to_llm(self, feedback_text: str) -> None:
+        """AI2 出力から「応答AIへの内省ノート」だけを抽出して AI1 に注入する。
+
+        失敗時 (新セクション未出力) は feedback_text 先頭 600 字でフォールバック。
+        これにより内部用語まみれの長文が AI1 のシステムプロンプトを支配することを防ぐ。
+        """
+        note = self._extract_ai1_note(feedback_text)
+        payload = note if note else feedback_text[:600]
         if hasattr(self.llm_handler, "update_memory"):
             try:
-                self.llm_handler.update_memory(feedback_text)
+                self.llm_handler.update_memory(payload)
             except Exception as e:
                 logger.warning("[Feedback] update_memory failed: %s", e)

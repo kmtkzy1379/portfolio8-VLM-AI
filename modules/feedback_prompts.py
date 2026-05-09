@@ -128,6 +128,7 @@ _FEP_POLICY_SECTION = """■ 行動選択 — Active Inference 風 LLM-assisted 
   1. 行動候補は固定 enum に縛られない。文脈から自由に列挙してよい。
      例: 「VLM 観察に対して軽く一言だけ反応して様子を見る」「沈黙ストリーク長いので静観継続」
          「ユーザーが集中しているので無音」「画面で予期しない変化があったので軽く問いかける」
+         「沈黙が長く文脈不明確なので、短い確認質問 (例:『集中してる？』) を 1 回だけ出す」
   2. 各候補について簡潔に評価 (1〜2文):
      - 期待される情報利得 (epistemic): その行動でユーザー/状況の不確実性がどれだけ減るか
      - 期待される pragmatic value: 長期目標 (ユーザーとの良好な共存) にどう寄与するか
@@ -243,6 +244,41 @@ _FEP_EPISODE_SECTION = """■ エピソード要約 (Episode Summary, Phase 4.3.
 """
 
 
+_FEP_AI1_NOTE_SECTION = """■ 応答AIへの内省ノート (AI1 注入用、自然な日本語で 400〜600 字)
+  ※ このセクションだけが応答AI「イブ」のシステムプロンプトに注入される。
+    FEP 用語・surprise proxy・L0-L3・EFE・Active Inference 等の内部用語は禁止。
+    AI1 が読んで「今こういう状況で、こう振る舞うべき」と即座にイメージできる文体で書け。
+
+  以下の小タイトル付きで必ず書く (regex 抽出される):
+
+  期間要約:
+    <2〜3 文。何が起きていたか、固有名詞・話題を含めて>
+  今の状況の見え方:
+    <1〜2 文。ユーザーは今どう見える (集中/離席/会話中など) か。沈黙が続いていれば秒数も。
+     画面で起きていることを一言で>
+  覚えておくこと:
+    - <ユーザーが直前に言った重要発言・約束・好み 1>
+    - <2>
+    - <3 まで>
+  動機:
+    <1〜2 文。なぜ次の行動を取るか、長期目標との接続>
+  次の推奨行動:
+    1. <1〜2 文の超具体行動。沈黙が長く文脈不明なら「短い確認質問を1回だけ」も候補>
+    2. <2>
+    3. <3>
+  避けたいこと:
+    - <ハルシネーション・ヤスマン化・空気読めない長文 など、今期に避けたいパターン 1〜2>
+
+  ※ 全体で 400〜600 字を目安に。長くなりすぎると AI1 のシステムプロンプトを圧迫する。
+  ※ 「期間要約」は recent_conversation が沈黙で押し出されたときの命綱になる。固有名詞を必ず含めよ。
+  ※ 「動機」は AI1 の長期目標 (goal_long) と接続して書け。
+  ※ goal_short は別経路で AI1 に注入されているため、このノートでは再注入しなくてよい。
+  ※ 入力に【前回の応答AI内省ノート】が与えられた場合、その「覚えておくこと」は
+    必ず継承し (内容を引き継ぎつつ、新情報を反映して書き直してよい)、世代を超えて
+    薄めるな。長期沈黙下でこの継承が AI1 の文脈維持の生命線になる。
+"""
+
+
 _FEP_META_NOTES = """【メタ認知の注意】
 - VLM (画面認識) の情報は不完全。矛盾があれば「VLM側の誤認識の可能性」と明記する。
 - 「前回と同じ画面が続いている」場合、VLMの微妙な揺らぎで誤検出している可能性に言及する。
@@ -269,6 +305,7 @@ FEP_PROMPT_SYSTEM: list[dict] = [
     {"type": "text", "text": _FEP_EPISODE_SECTION},         # Phase 4.3.1
     {"type": "text", "text": _FEP_HIERARCHY_SECTION},
     {"type": "text", "text": _FEP_POLICY_SECTION},
+    {"type": "text", "text": _FEP_AI1_NOTE_SECTION},        # AI1 注入用 (regex 抽出)
     {"type": "text", "text": _FEP_META_NOTES, "cache_control": {"type": "ephemeral"}},
 ]
 
@@ -325,6 +362,36 @@ _SILENT_PROCESS = """【実行プロセス】
   ※ 目安: keep:update = 4:1 程度。
 """
 
+_SILENT_AI1_NOTE_SECTION = """■ 応答AIへの内省ノート (AI1 注入用、自然な日本語で 300〜500 字)
+  ※ 沈黙期間の出力でも、応答AI「イブ」のシステムプロンプトに注入される。
+    FEP 用語・surprise proxy 等の内部用語は禁止。
+
+  以下の小タイトル付きで必ず書く (regex 抽出される):
+
+  期間要約:
+    <2〜3 文。沈黙前に何があったか、現在沈黙が約何秒続いているか>
+  今の状況の見え方:
+    <1〜2 文。ユーザー状態の推測 (集中/離席/作業中など)、画面で見えること>
+  覚えておくこと:
+    - <沈黙前の会話で重要だった点 1>
+    - <2>
+  動機:
+    <1〜2 文。なぜ静観/声かけを選ぶか、長期目標との接続>
+  次の推奨行動:
+    1. <1〜2 文の超具体行動。沈黙が長く不明確なら「短い確認質問を1回だけ」を候補に>
+    2. <2>
+  避けたいこと:
+    - <長い独白・ハルシネーション・空気を破る行動 など>
+
+  ※ 全体で 300〜500 字。
+  ※ 沈黙ストリークが長い場合は静観を基本としつつ、確認質問の選択肢も明示してよい。
+  ※ goal_short は別経路で AI1 に注入されているため、このノートでは再注入しなくてよい。
+  ※ 入力に【前回の応答AI内省ノート】が与えられた場合、その「覚えておくこと」は
+    必ず継承し (内容を引き継ぎつつ、新情報を反映して書き直してよい)、世代を超えて
+    薄めるな。沈黙ループでこの継承を切ると、ユーザーとの過去文脈が完全に失われる。
+"""
+
+
 _SILENT_POLICY_SECTION = """■ 沈黙中の行動選択 (Phase 3.3 軽量版, LLM-assisted)
   ※ 完全な active inference の数式評価は行わず、文脈解釈で自然に選ぶ。
   与えられた補助統計 (沈黙時間・ストリーク・直近対話頻度・階層 surprise 統合) を踏まえ、
@@ -341,6 +408,7 @@ _SILENT_POLICY_SECTION = """■ 沈黙中の行動選択 (Phase 3.3 軽量版, L
 SILENT_PROMPT_SYSTEM: list[dict] = [
     {"type": "text", "text": _SILENT_ROLE},
     {"type": "text", "text": _SILENT_PROCESS},
+    {"type": "text", "text": _SILENT_AI1_NOTE_SECTION},     # AI1 注入用 (regex 抽出)
     {"type": "text", "text": _SILENT_POLICY_SECTION, "cache_control": {"type": "ephemeral"}},
 ]
 
@@ -423,6 +491,9 @@ def build_fep_user_text(
     action_context: dict | None = None,
     prev_prediction_block: str = "",
     precision_block: str = "",
+    silence_seconds: float = 0.0,
+    ellipsis_count: int = 0,
+    prev_ai1_note: str = "",
 ) -> str:
     """通常FEPプロンプト用の user メッセージを組み立てる。
 
@@ -433,6 +504,8 @@ def build_fep_user_text(
             整形したブロック。空文字なら省略 (初回起動・予測抽出失敗時)。
         precision_block: Phase 4.2 で precision モード + Affective Inference 用の
             因果叙述 + 過信警告ブロック。cold-start や抽出失敗時は空文字。
+        silence_seconds: 直前の実ユーザ発話からの経過秒数 (0 なら省略)。
+        ellipsis_count: その期間中の内部見守り (「…」) 発火回数。
     """
     action_text = _format_action_context(action_context, full=True)
     pred_text = ""
@@ -441,6 +514,20 @@ def build_fep_user_text(
     prec_text = ""
     if precision_block:
         prec_text = "\n" + precision_block + "\n"
+    silence_text = ""
+    if silence_seconds >= 5.0 or ellipsis_count > 0:
+        silence_text = (
+            f"\n【沈黙状況】 直前の実ユーザ発話から約 {int(silence_seconds)} 秒、"
+            f"内部見守り発火 {ellipsis_count} 回\n"
+        )
+    # Phase 2.4: 前回 AI1 内省ノートを渡して「覚えておくこと」を継承させる
+    note_text = ""
+    if prev_ai1_note:
+        note_text = (
+            f"\n【前回の応答AI内省ノート (要継承)】\n"
+            f"※ 下記の「覚えておくこと」を必ず継承し、新しい情報があれば追加せよ。\n"
+            f"{_truncate(prev_ai1_note, 800)}\n"
+        )
     return (
         f"【期間】{window_start} 〜 {window_end} "
         f"/ 対話ターン数: {n_turns} / VLMフレーム数: {n_vlm_frames}\n\n"
@@ -452,6 +539,8 @@ def build_fep_user_text(
         f"{vlm_block or '(VLM情報なし)'}\n\n"
         f"【最新ユーザー発話】\n"
         f"{_truncate(last_user_utterance, 400) or '(直近の明確な発話なし)'}\n"
+        f"{silence_text}"
+        f"{note_text}"
         f"{pred_text}"
         f"{prec_text}"
         f"{action_text}\n"
@@ -472,6 +561,7 @@ def build_silent_user_text(
     prev_feedback_head: str,
     vlm_block: str = "",
     action_context_lite: dict | None = None,
+    prev_ai1_note: str = "",
 ) -> str:
     """無言期間プロンプト用の user メッセージを組み立てる。
 
@@ -485,6 +575,15 @@ def build_silent_user_text(
     """
     streak_label = f"沈黙×{silence_streak}" if silence_streak > 1 else "沈黙"
     action_text = _format_action_context(action_context_lite, full=False)
+    # Phase 2.4: 前回 AI1 内省ノートを継承 (沈黙ループでこそ重要)
+    note_text = ""
+    if prev_ai1_note:
+        note_text = (
+            f"\n【前回の応答AI内省ノート (要継承)】\n"
+            f"※ 下記の「覚えておくこと」を必ず継承し、新情報があれば追加せよ。"
+            f"沈黙が続いてもユーザーとの過去文脈を失わないこと。\n"
+            f"{_truncate(prev_ai1_note, 800)}\n"
+        )
     return (
         f"【無音継続】{streak_label} (累計約 {int(idle_seconds)} 秒)\n\n"
         f"【沈黙前の対話 (直近 {n_pre_silence_pairs} 件)】\n"
@@ -497,6 +596,7 @@ def build_silent_user_text(
         f"{vlm_block or '(変化なし or VLM未起動)'}\n\n"
         f"【前回フィードバック要旨】\n"
         f"{_truncate(prev_feedback_head, 400) or '(なし)'}\n"
+        f"{note_text}"
         f"{action_text}\n"
         f"以上を観測対象として、指定フォーマットで 1000〜1500 字の静寂解釈フィードバックを生成してください。"
     )

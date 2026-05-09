@@ -278,6 +278,9 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         self.history = [{"role": "system", "content": self.system_prompt}]
         self.ai2_feedback = ""  # AI2フィードバックを専用変数で保持
         self.vlm_context = ""  # VLM画面認識コンテキスト
+        # 沈黙サマリ (ConversationCache.get_silence_summary の戻り値)。
+        # recent_turns から「…」を除外したため、その情報を別経路で AI1 に渡す。
+        self.silence_summary: Optional[dict] = None
 
         # Phase 3: Vision components
         self._vlm_bridge = None
@@ -331,11 +334,12 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
     def _build_system_prompt(self, user_text: str) -> str:
         """システムプロンプトを動的再構築"""
         # AI2フィードバックコンテキスト
+        # AI2 (FeedbackHandler) が抽出した「応答AIへの内省ノート」だけがここに来る。
+        # FEP 用語を含む長文ではなく、自然な日本語で書かれた行動指針。
         ai2_context = ""
         if self.ai2_feedback:
             ai2_context = (
-                "\n[AI2 Self-Feedback — あなたの内省AIが直前に生成した指針。"
-                "特に『次の推奨行動』『一貫した行動目標』を優先して振る舞え]:\n"
+                "\n[直前期間の内省ノート — AI1 行動指針]:\n"
                 f"{self.ai2_feedback}\n"
             )
 
@@ -365,10 +369,24 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                         rag_context += f"   AI: {ai_text}\n"
             rag_context += "\n"
 
-        # 直近5ターン
+        # 沈黙サマリ (recent_turns から「…」を除外して失った情報を補う)
+        # 5 秒未満は通常の会話往復とみなして表示しない (ノイズ抑制)。
+        silence_context = ""
+        if self.silence_summary:
+            sec = float(self.silence_summary.get("silence_seconds") or 0.0)
+            ec = int(self.silence_summary.get("ellipsis_count") or 0)
+            if sec >= 5.0 or ec > 0:
+                silence_context = (
+                    f"[沈黙サマリ]: 直前の実発話から約 {int(sec)} 秒、"
+                    f"内部見守り (…) {ec} 回\n"
+                    "  ※ 上の Recent Conversation は「…」を除外した直前の実会話。"
+                    "沈黙が長いほど確認質問の選択肢を意識せよ。\n\n"
+                )
+
+        # 直近5ターン (「…」は除外済み、生は base_mode 側でフィルタ)
         recent_context = ""
         if hasattr(self, "recent_turns") and self.recent_turns:
-            recent_context = "[Recent Conversation (Last 5 turns)]:\n"
+            recent_context = "[Recent Conversation (直前の実会話)]:\n"
             for i, turn in enumerate(self.recent_turns, 1):
                 recent_context += f"{i}. User: {turn.get('user', '')}\n"
                 if turn.get('ai'):
@@ -430,7 +448,7 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         combined = (
             ai2_context + vlm_context_str + vision_hint
-            + rag_context + recent_context + goal_block
+            + rag_context + silence_context + recent_context + goal_block
         )
         return (
             base_content + combined +
@@ -473,8 +491,50 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         return f"不明なツール: {tool_name}"
 
+    def _collapse_silence_pairs(self) -> None:
+        """history 配列から連続する user='…' / assistant='…' ペアを完全除去する。
+
+        Phase 2.3: 沈黙情報は _build_system_prompt の [沈黙サマリ] で既に LLM に
+        渡るため、messages 配列側に「…」交換を残す必要はない。むしろ残ると LLM が
+        「直前は…と返した」と誤分析し、本来の会話文脈への注意を失う。
+
+        ペア単位 (user/assistant 両方が「…」) のみ除去するため、user/assistant の
+        交互配置制約は壊れない (provider safe)。tool_call/tool ペアや、片方だけ
+        「…」のケースには触らない。
+        """
+        if len(self.history) < 3:
+            return
+        new_history = [self.history[0]]  # system は必ず保持
+        i = 1
+        while i < len(self.history):
+            msg = self.history[i]
+            # user='…' + assistant='…' のペアを検出 → スキップ
+            if (
+                msg.get("role") == "user"
+                and isinstance(msg.get("content"), str)
+                and msg.get("content", "").strip() == "…"
+                and i + 1 < len(self.history)
+            ):
+                nxt = self.history[i + 1]
+                if (
+                    nxt.get("role") == "assistant"
+                    and isinstance(nxt.get("content"), str)
+                    and nxt.get("content", "").strip() == "…"
+                ):
+                    i += 2  # ペアを丸ごとスキップ
+                    continue
+            new_history.append(msg)
+            i += 1
+        self.history = new_history
+
     def _safe_trim_history(self) -> None:
-        """tool_call/toolペアを壊さないようにhistoryをトリミング"""
+        """tool_call/toolペアを壊さないようにhistoryをトリミング。
+
+        Phase 2.3: 先に _collapse_silence_pairs を呼んで「…」ペアを除去してから
+        通常の長さトリミングを行う。これにより 9 件保持の枠が「…」で埋まる
+        問題を解決する。
+        """
+        self._collapse_silence_pairs()
         if len(self.history) <= 10:
             return
 

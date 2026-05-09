@@ -102,8 +102,17 @@ class TalkMode(BaseMode):
             rag_memories = await self.rag.get_random_turns(count=2)
             self.llm.rag_memories = rag_memories
 
-            recent_turns = await self.conversation_cache.get_recent_turns(count=5)
+            recent_turns = await self.conversation_cache.get_recent_turns(
+                count=5, exclude_ellipsis=True,
+            )
             self.llm.recent_turns = recent_turns
+            try:
+                self.llm.silence_summary = (
+                    await self.conversation_cache.get_silence_summary()
+                )
+            except Exception as e:
+                self.log("System", f"silence_summary failed: {e}")
+                self.llm.silence_summary = None
 
             # VLMコンテキストを最新に更新
             if self.vlm_bridge and self.vlm_bridge.is_running:

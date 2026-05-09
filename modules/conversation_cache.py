@@ -131,12 +131,75 @@ class ConversationCache:
         # ファイルに非同期書き込み
         await self._write_queue.put(entry)
     
-    async def get_recent_turns(self, count: int = 5) -> List[Dict[str, str]]:
-        """直近のターンを取得（メモリから高速に取得）"""
+    async def get_recent_turns(
+        self, count: int = 5, exclude_ellipsis: bool = False,
+    ) -> List[Dict[str, str]]:
+        """直近のターンを取得（メモリから高速に取得）
+
+        Args:
+            count: 取得するターン数。
+            exclude_ellipsis: True なら user 発話が「…」だけのターンを除外する。
+                沈黙時に AI 自身が出した内部見守り発話で recent_conversation が
+                埋まり、直前の実会話が押し出される問題への対策。
+        """
         async with self._lock:
-            recent = list(self.turns)[-count:] if len(self.turns) > count else list(self.turns)
+            all_turns = list(self.turns)
+            if exclude_ellipsis:
+                all_turns = [t for t in all_turns if t.get("user", "").strip() != "…"]
+            recent = all_turns[-count:] if len(all_turns) > count else all_turns
             return [{"user": turn["user"], "ai": turn["ai"]} for turn in recent]
-    
+
+    async def get_silence_summary(self) -> Dict[str, Optional[float]]:
+        """直前期間の沈黙状態を計算する。
+
+        最後の「…」以外のユーザターンを起点として、現在までの経過秒数と
+        その間に発火した内部見守り (「…」入力) の件数を返す。
+
+        Returns:
+            {
+                "silence_seconds": float,  # 直近実ユーザ発話からの経過秒 (0.0 if 不明)
+                "ellipsis_count": int,     # その期間中の「…」入力回数
+                "last_real_user_ts": Optional[str],  # ISO 8601 / None
+            }
+        """
+        async with self._lock:
+            turns = list(self.turns)
+
+        last_real_idx: Optional[int] = None
+        for i in range(len(turns) - 1, -1, -1):
+            if turns[i].get("user", "").strip() != "…":
+                last_real_idx = i
+                break
+
+        ellipsis_count = 0
+        last_real_user_ts: Optional[str] = None
+        silence_seconds: float = 0.0
+
+        if last_real_idx is None:
+            ellipsis_count = sum(
+                1 for t in turns if t.get("user", "").strip() == "…"
+            )
+        else:
+            last_real_user_ts = turns[last_real_idx].get("user_timestamp") or None
+            ellipsis_count = sum(
+                1 for t in turns[last_real_idx + 1:]
+                if t.get("user", "").strip() == "…"
+            )
+            if last_real_user_ts:
+                try:
+                    last_dt = datetime.fromisoformat(last_real_user_ts)
+                    silence_seconds = max(
+                        0.0, (datetime.now() - last_dt).total_seconds()
+                    )
+                except (ValueError, TypeError):
+                    silence_seconds = 0.0
+
+        return {
+            "silence_seconds": silence_seconds,
+            "ellipsis_count": ellipsis_count,
+            "last_real_user_ts": last_real_user_ts,
+        }
+
     async def shutdown(self):
         """終了処理"""
         if self._write_task:
