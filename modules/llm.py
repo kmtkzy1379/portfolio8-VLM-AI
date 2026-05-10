@@ -9,6 +9,13 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+# AI への注入記録専用 logger。MainWindow 側で UI ハンドラを attach することで
+# Show debug 時のみ UI の Log 枠に「[Inject] ...」として流れる。
+# propagate=False で root logger 経由の二重伝播を防止。modules.llm の通常 warn/error
+# はこちらに混ざらない（あちらは getLogger(__name__)、このロガーは "eve.inject"）。
+inject_logger = logging.getLogger("eve.inject")
+inject_logger.propagate = False
+
 # Provider detection: model name prefix → (client_factory, default_max_tokens)
 _OPENAI_PREFIXES = ("gpt-", "o1-", "o3-", "o4-")
 
@@ -450,6 +457,26 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             ai2_context + vlm_context_str + vision_hint
             + rag_context + silence_context + recent_context + goal_block
         )
+
+        # Inject ログ: 何が AI1 に注入されたかを Show debug 時に UI に流す。
+        # 中身は配信時にユーザー発話が漏れる可能性があるため先頭 300 文字に制限。
+        inject_logger.debug(
+            "sys_total=%d ai2=%d vlm=%d rag=%d silence=%d recent=%d goal=%d vision_hint=%d",
+            len(combined),
+            len(ai2_context), len(vlm_context_str), len(rag_context),
+            len(silence_context), len(recent_context), len(goal_block), len(vision_hint),
+        )
+        if rag_context:
+            inject_logger.debug("RAG: %s", rag_context[:300])
+        if vlm_context_str:
+            inject_logger.debug("VLM: %s", vlm_context_str[:300])
+        if ai2_context:
+            inject_logger.debug("AI2: %s", ai2_context[:300])
+        if recent_context:
+            inject_logger.debug("RECENT: %s", recent_context[:300])
+        if goal_block:
+            inject_logger.debug("GOAL: %s", goal_block[:300])
+
         return (
             base_content + combined +
             "\n# Start Conversation\n以上の設定と記憶をロードしました。"

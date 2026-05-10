@@ -17,11 +17,12 @@ from modules import (
 class BaseMode(ABC):
     """全モードの基底クラス"""
 
-    def __init__(self, system_prompt: str, log_callback: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, system_prompt: str, log_callback: Optional[Callable[[str, str, str], None]] = None):
         """
         Args:
             system_prompt: このモード用のシステムプロンプト
-            log_callback: UIにログを送るコールバック関数 (role, message) -> None
+            log_callback: UIにログを送るコールバック関数 (role, message, level) -> None
+                          level は "info" | "debug"。debug は UI 側で Show debug 時のみ表示される。
         """
         self.system_prompt = system_prompt
         self.log_callback = log_callback
@@ -53,7 +54,7 @@ class BaseMode(ABC):
     async def initialize(self):
         """共通コンポーネントの初期化"""
         self._loop = asyncio.get_running_loop()
-        self.log("System", "Initializing components...")
+        self.log("System", "Initializing components...", level="debug")
 
         # コンポーネント初期化
         self.player = AudioPlayer()
@@ -69,7 +70,7 @@ class BaseMode(ABC):
         # AI2フィードバック用のコールバック設定
         def update_memory_func(memory_text):
             self.llm.ai2_feedback = memory_text[:Config.FB_LOOP_MAX_CHARS]
-            self.log("System", f"AI2 Feedback Updated ({len(memory_text)} chars)")
+            self.log("System", f"AI2 Feedback Updated ({len(memory_text)} chars)", level="debug")
         self.llm.update_memory = update_memory_func
         self.llm.rag = self.rag
 
@@ -91,7 +92,7 @@ class BaseMode(ABC):
 
     async def shutdown(self):
         """終了処理"""
-        self.log("System", "Shutting down...")
+        self.log("System", "Shutting down...", level="debug")
         self.stop_requested = True
         self.running = False
 
@@ -164,7 +165,7 @@ class BaseMode(ABC):
                 rag_task = asyncio.create_task(self.rag.search_similar(input_text))
                 rag_memories = await asyncio.wait_for(rag_task, timeout=1.5)
                 if rag_memories:
-                    self.log("System", f"RAG found: {len(rag_memories)} memories")
+                    self.log("System", f"RAG found: {len(rag_memories)} memories", level="debug")
             except asyncio.TimeoutError:
                 self.log("System", "RAG timeout - proceeding without memories")
             except Exception as e:
@@ -235,7 +236,7 @@ class BaseMode(ABC):
                 self.feedback.signal_turn_done()
 
             total_time = time.time() - start_time
-            self.log("System", f"Response time: {total_time*1000:.1f}ms")
+            self.log("System", f"Response time: {total_time*1000:.1f}ms", level="debug")
 
             return ai_response
 
@@ -243,9 +244,16 @@ class BaseMode(ABC):
             self.is_processing = False
             self.on_response_complete()
 
-    def log(self, role: str, message: str):
-        """ログ出力"""
-        # コンソール出力
+    def log(self, role: str, message: str, level: str = "info"):
+        """ログ出力
+
+        Args:
+            role: User / AI / System / Comment / Game / Inject など
+            message: ログ本文
+            level: "info" (普段表示) または "debug" (Show debug 時のみ UI 表示)
+                   コンソール出力には level の影響なし（常に出る）。
+        """
+        # コンソール出力（debug レベルもコンソールには出す）
         if role == "User":
             print(Fore.WHITE + f"\n{role}: {message}")
         elif role == "AI":
@@ -255,7 +263,7 @@ class BaseMode(ABC):
 
         # UIコールバック
         if self.log_callback:
-            self.log_callback(role, message)
+            self.log_callback(role, message, level)
 
     def on_response_complete(self):
         """応答完了時のコールバック（サブクラスでオーバーライド可能）"""
@@ -311,7 +319,7 @@ class BaseMode(ABC):
             existing = self.llm.vlm_context or ""
             self.llm.vlm_context = f"{alert}\n{existing}"[:800]
 
-        self.log("System", f"Vision nudge: {alert[:100]}...")
+        self.log("System", f"Vision nudge: {alert[:100]}...", level="debug")
 
         # フィードバックループに VLM イベント通知 (即ウェイク)
         if self.feedback:
@@ -330,7 +338,7 @@ class BaseMode(ABC):
             except asyncio.QueueEmpty:
                 break
         if drained:
-            self.log("System", f"Vision queue drained: {drained} frames skipped")
+            self.log("System", f"Vision queue drained: {drained} frames skipped", level="debug")
 
     def interrupt(self):
         """音声再生を中断"""

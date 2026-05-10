@@ -28,7 +28,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 class GameMode(BaseMode):
     """ゲームモード：Pキー + OCR + 無言処理なし"""
     
-    def __init__(self, log_callback: Optional[Callable[[str, str], None]] = None,
+    def __init__(self, log_callback: Optional[Callable[[str, str, str], None]] = None,
                  ready_callback: Optional[Callable[[], None]] = None):
         """
         Args:
@@ -65,7 +65,7 @@ class GameMode(BaseMode):
             self.screen_width = monitor['width']
             self.screen_height = monitor['height']
         
-        self.log("System", f"Screen: {self.screen_width}x{self.screen_height}")
+        self.log("System", f"Screen: {self.screen_width}x{self.screen_height}", level="debug")
         
         # Pキー・Oキーのフック設定
         keyboard.on_press_key('p', lambda _: self._on_p_pressed())
@@ -180,7 +180,7 @@ class GameMode(BaseMode):
             output_cost = output_tokens * 10.00 / 1_000_000
             total_cost_jpy = (input_cost + output_cost) * 150
             
-            self.log("System", f"OCR Cost: ¥{total_cost_jpy:.4f}")
+            self.log("System", f"OCR Cost: ¥{total_cost_jpy:.4f}", level="debug")
             
             return text if text else ""
             
@@ -235,7 +235,7 @@ class GameMode(BaseMode):
 
             description = await analyzer.analyze(jpeg_bytes, prompt)
 
-            self.log("System", "Vision: Maverick (fast)")
+            self.log("System", "Vision: Maverick (fast)", level="debug")
             return description if description else ""
 
         except Exception as e:
@@ -298,7 +298,7 @@ class GameMode(BaseMode):
             output_cost = output_tokens * 10.00 / 1_000_000
             total_cost_jpy = (input_cost + output_cost) * 150
 
-            self.log("System", f"Vision Cost: ¥{total_cost_jpy:.4f}")
+            self.log("System", f"Vision Cost: ¥{total_cost_jpy:.4f}", level="debug")
 
             return description if description else ""
 
@@ -311,13 +311,13 @@ class GameMode(BaseMode):
         self.is_processing = True
         
         try:
-            self.log("System", "Capturing screen...")
+            self.log("System", "Capturing screen...", level="debug")
             
             # キャプチャ（非同期で実行）
             loop = asyncio.get_running_loop()
             image = await loop.run_in_executor(None, self.capture_bottom_half)
             
-            self.log("System", "Running OCR...")
+            self.log("System", "Running OCR...", level="debug")
             
             # OCR実行
             ocr_text = await self.perform_ocr(image)
@@ -342,13 +342,13 @@ class GameMode(BaseMode):
         self.is_processing = True
         
         try:
-            self.log("System", "Capturing full screen...")
+            self.log("System", "Capturing full screen...", level="debug")
             
             # 画面全体をキャプチャ（非同期で実行）
             loop = asyncio.get_running_loop()
             image = await loop.run_in_executor(None, self.capture_full_screen)
             
-            self.log("System", "Running Vision Analysis...")
+            self.log("System", "Running Vision Analysis...", level="debug")
             
             # 画像解析実行
             description = await self.perform_vision_analysis(image)
@@ -370,7 +370,7 @@ class GameMode(BaseMode):
     
     async def run(self):
         """ゲームモードのメインループ"""
-        self.log("System", "Starting Game Mode main loop...")
+        self.log("System", "Starting Game Mode main loop...", level="debug")
         self.log("System", "Press P (OCR) / O (Vision)")
         
         try:
@@ -385,6 +385,6 @@ class GameMode(BaseMode):
                     await asyncio.sleep(0.1)
                     
         except asyncio.CancelledError:
-            self.log("System", "Game Mode cancelled")
+            self.log("System", "Game Mode cancelled", level="debug")
         except Exception as e:
             self.log("System", f"Error in Game Mode: {e}")

@@ -26,7 +26,7 @@ CURRENCY_SYMBOLS = {
 class YouTubeMode(BaseMode):
     """YouTubeモード：コメント読み上げ"""
     
-    def __init__(self, log_callback: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, log_callback: Optional[Callable[[str, str, str], None]] = None):
         super().__init__(YOUTUBE_SYSTEM_PROMPT, log_callback)
         
         # YouTube API
@@ -48,22 +48,22 @@ class YouTubeMode(BaseMode):
         self.youtube = build('youtube', 'v3', developerKey=Config.YOUTUBE_API_KEY)
         
         # ライブ配信を検索
-        self.log("System", f"Searching for live stream on channel: {Config.TARGET_CHANNEL_ID}")
-        
+        self.log("System", f"Searching for live stream on channel: {Config.TARGET_CHANNEL_ID}", level="debug")
+
         self.video_id = await self._get_live_video_id()
         if not self.video_id:
             self.log("System", "No live stream found")
             return
-        
-        self.log("System", f"Found live stream: {self.video_id}")
-        
+
+        self.log("System", f"Found live stream: {self.video_id}", level="debug")
+
         # ライブチャットID取得
         self.live_chat_id = await self._get_live_chat_id()
         if not self.live_chat_id:
             self.log("System", "Failed to get live chat ID")
             return
-        
-        self.log("System", f"Live chat ID: {self.live_chat_id}")
+
+        self.log("System", f"Live chat ID: {self.live_chat_id}", level="debug")
         self.log("System", "YouTube Mode Ready")
     
     async def _get_live_video_id(self) -> Optional[str]:
@@ -210,7 +210,7 @@ class YouTubeMode(BaseMode):
             self.log("System", "Cannot start - no live chat ID")
             return
         
-        self.log("System", "Starting YouTube Mode main loop...")
+        self.log("System", "Starting YouTube Mode main loop...", level="debug")
         
         try:
             while self.running and not self.stop_requested:
@@ -232,6 +232,6 @@ class YouTubeMode(BaseMode):
                     await asyncio.sleep(2)
                     
         except asyncio.CancelledError:
-            self.log("System", "YouTube Mode cancelled")
+            self.log("System", "YouTube Mode cancelled", level="debug")
         except Exception as e:
             self.log("System", f"Error in YouTube Mode: {e}")

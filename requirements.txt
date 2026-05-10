@@ -7,7 +7,7 @@ PyYAML==6.0.3
 
 # AI / LLM (Eve)
 groq==1.2.0
-openai==2.35.1
+openai==2.24.0
 anthropic==0.100.0
 
 # AI / LLM (VLM)
@@ -46,7 +46,7 @@ tf-keras==2.21.0
 keyboard==0.13.5
 
 # HTTP
-aiohttp==3.13.5
+aiohttp==3.13.4
 requests==2.33.1
 
 # YouTube API
@@ -54,4 +54,3 @@ google-api-python-client==2.196.0
 
 # VTube Studio Connection
 websockets==16.0
-

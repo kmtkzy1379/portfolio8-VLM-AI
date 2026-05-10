@@ -3,10 +3,30 @@ Tkinter UIメインウィンドウ
 シンプル＆かわいいデザイン + VLM統合
 """
 import asyncio
+import logging
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from typing import Optional
 import threading
+
+
+class _UIInjectLogHandler(logging.Handler):
+    """eve.inject logger の出力を MainWindow の add_log に橋渡しするハンドラ。
+
+    add_log は内部で root.after(0, ...) を使って UI スレッドへポストするので、
+    asyncio スレッドや VLM スレッドから呼ばれてもスレッドセーフ。
+    """
+
+    def __init__(self, ui_callback):
+        super().__init__(level=logging.DEBUG)
+        self.ui_callback = ui_callback
+
+    def emit(self, record):
+        try:
+            self.ui_callback("Inject", record.getMessage(), "debug")
+        except Exception:
+            # UI 側の例外で logger を落とさない
+            pass
 
 
 class MainWindow:
@@ -16,8 +36,9 @@ class MainWindow:
         self.loop = loop
         self.root = tk.Tk()
         self.root.title("Eve AI System")
-        self.root.geometry("500x800")
+        self.root.geometry("500x780")
         self.root.resizable(True, True)
+        self.root.minsize(500, 700)
 
         # カラースキーム（シンプル＆かわいい）
         self.colors = {
@@ -43,8 +64,20 @@ class MainWindow:
         self._vlm_bridge = None
         self._vlm_enabled = tk.BooleanVar(value=False)
 
+        # Debug log toggle (default OFF; ON で AI への注入ログ等が UI に流れる)
+        self._show_debug = tk.BooleanVar(value=False)
+
         # UI構築
         self._create_widgets()
+
+        # eve.inject logger に UI ハンドラを attach（冪等: 既存の同種ハンドラを除去後に追加）
+        inject_logger = logging.getLogger("eve.inject")
+        inject_logger.setLevel(logging.DEBUG)
+        inject_logger.handlers = [
+            h for h in inject_logger.handlers
+            if not isinstance(h, _UIInjectLogHandler)
+        ]
+        inject_logger.addHandler(_UIInjectLogHandler(self.add_log))
 
         # ウィンドウ閉じるイベント
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -67,7 +100,31 @@ class MainWindow:
             bg=self.colors['accent'],
             fg='white'
         )
-        title_label.pack(pady=12)
+        title_label.pack(side=tk.LEFT, padx=15, pady=12)
+
+        # ⚙ Settings ボタン（ヘッダー右端）
+        self._settings_button = tk.Button(
+            header_frame,
+            text="⚙ Settings",
+            font=('Segoe UI', 9),
+            bg=self.colors['accent'],
+            fg='white',
+            relief=tk.FLAT,
+            cursor='hand2',
+            activebackground='#FFAAAA',
+            command=self._open_settings,
+        )
+        self._settings_button.pack(side=tk.RIGHT, padx=10)
+
+        # 「⚠ Restart needed」ラベル（Save 後に visible になる）
+        self._restart_needed_label = tk.Label(
+            header_frame,
+            text="⚠ Restart needed",
+            font=('Segoe UI', 9, 'bold'),
+            bg=self.colors['accent'],
+            fg='#FFEB3B',
+        )
+        # 初期は非表示。Save 時に pack する。
 
         # メインコンテンツ
         main_frame = tk.Frame(self.root, bg=self.colors['bg'])
@@ -172,18 +229,78 @@ class MainWindow:
         )
         self.status_label.pack(side=tk.LEFT, padx=8)
 
-        # ログフレーム
-        log_frame = tk.LabelFrame(
+        # Show debug logs（ON で AI への注入ログ等が UI に流れる。配信中は OFF 推奨）
+        self._show_debug_check = tk.Checkbutton(
+            status_inner,
+            text="Show debug logs",
+            variable=self._show_debug,
+            font=('Segoe UI', 9),
+            bg=self.colors['frame_bg'],
+            fg=self.colors['system'],
+            selectcolor=self.colors['accent'],
+            activebackground=self.colors['frame_bg']
+        )
+        self._show_debug_check.pack(side=tk.RIGHT)
+
+        # ボタンフレーム
+        # NOTE: pack 順は画面表示順と一致しない。side=BOTTOM を先に pack することで
+        # Tkinter は available area の下端を最初に確保し、後続の log_frame が
+        # expand=True でどれだけ縦を取ろうがボタンが画面外に押し出されないようにする。
+        self._button_frame = tk.Frame(main_frame, bg=self.colors['bg'])
+        self._button_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.start_button = tk.Button(
+            self._button_frame,
+            text="Start",
+            font=('Segoe UI', 11, 'bold'),
+            bg=self.colors['ready'],
+            fg='white',
+            width=12,
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._on_start
+        )
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.stop_button = tk.Button(
+            self._button_frame,
+            text="Stop",
+            font=('Segoe UI', 11, 'bold'),
+            bg='#E57373',
+            fg='white',
+            width=12,
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._on_stop,
+            state=tk.DISABLED
+        )
+        self.stop_button.pack(side=tk.LEFT)
+
+        clear_button = tk.Button(
+            self._button_frame,
+            text="Clear Log",
+            font=('Segoe UI', 9),
+            bg='#BDBDBD',
+            fg='white',
+            width=10,
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._clear_log
+        )
+        clear_button.pack(side=tk.RIGHT)
+
+        # ログフレーム（button_frame の上の残りスペース全部）
+        self._log_frame = tk.LabelFrame(
             main_frame,
             text=" Log ",
             font=('Segoe UI', 10),
             bg=self.colors['frame_bg'],
             fg=self.colors['text']
         )
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self._log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
+            self._log_frame,
             font=('Consolas', 9),
             bg='#FAFAFA',
             fg=self.colors['text'],
@@ -199,19 +316,21 @@ class MainWindow:
         self.log_text.tag_configure('system', foreground=self.colors['system'])
         self.log_text.tag_configure('comment', foreground='#9C27B0')
         self.log_text.tag_configure('game', foreground='#009688')
+        self.log_text.tag_configure('debug', foreground='#888888')
+        self.log_text.tag_configure('inject', foreground='#0088AA')
 
-        # VLM ログフレーム
-        vlm_log_frame = tk.LabelFrame(
+        # VLM ログフレーム — _create_widgets では作るだけで pack しない。
+        # _start_vlm() で log_frame の直後に挿入し、_stop_vlm() で pack_forget する。
+        self._vlm_log_frame = tk.LabelFrame(
             main_frame,
             text=" VLM Log ",
             font=('Segoe UI', 10),
             bg=self.colors['frame_bg'],
             fg=self.colors['text']
         )
-        vlm_log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         self._vlm_log_text = scrolledtext.ScrolledText(
-            vlm_log_frame,
+            self._vlm_log_frame,
             font=('Consolas', 9),
             bg='#F0F0F0',
             fg=self.colors['text'],
@@ -224,51 +343,6 @@ class MainWindow:
         # VLMログタグ設定
         self._vlm_log_text.tag_configure('vlm', foreground='#00796B')
         self._vlm_log_text.tag_configure('vlm_error', foreground='#D32F2F')
-
-        # ボタンフレーム
-        button_frame = tk.Frame(main_frame, bg=self.colors['bg'])
-        button_frame.pack(fill=tk.X)
-
-        self.start_button = tk.Button(
-            button_frame,
-            text="Start",
-            font=('Segoe UI', 11, 'bold'),
-            bg=self.colors['ready'],
-            fg='white',
-            width=12,
-            relief=tk.FLAT,
-            cursor='hand2',
-            command=self._on_start
-        )
-        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.stop_button = tk.Button(
-            button_frame,
-            text="Stop",
-            font=('Segoe UI', 11, 'bold'),
-            bg='#E57373',
-            fg='white',
-            width=12,
-            relief=tk.FLAT,
-            cursor='hand2',
-            command=self._on_stop,
-            state=tk.DISABLED
-        )
-        self.stop_button.pack(side=tk.LEFT)
-
-        # クリアボタン
-        clear_button = tk.Button(
-            button_frame,
-            text="Clear Log",
-            font=('Segoe UI', 9),
-            bg='#BDBDBD',
-            fg='white',
-            width=10,
-            relief=tk.FLAT,
-            cursor='hand2',
-            command=self._clear_log
-        )
-        clear_button.pack(side=tk.RIGHT)
 
     def _update_indicator(self, status: str):
         """インジケーター更新"""
@@ -286,26 +360,43 @@ class MainWindow:
             )
         self.root.after(0, update)
 
-    def add_log(self, role: str, message: str):
-        """ログ追加（スレッドセーフ）"""
+    def add_log(self, role: str, message: str, level: str = "info"):
+        """ログ追加（スレッドセーフ）
+
+        level="debug" のログは Show debug チェックが ON の時のみ表示する。
+        AI への注入ログは role="Inject" + level="debug" で来るので専用色で出す。
+        """
+        # debug ログは Show debug OFF なら捨てる（UI スレッド外でチェック OK、
+        # tk.BooleanVar.get() は読み取り専用なので race しない）
+        if level == "debug" and not self._show_debug.get():
+            return
+
         def update():
             self.log_text.config(state=tk.NORMAL)
 
             # タグ選択
-            tag = 'system'
-            prefix = f"[{role}]"
-            if role.lower() == 'user':
+            role_lower = role.lower()
+            if role_lower == 'user':
                 tag = 'user'
                 prefix = "User:"
-            elif role.lower() == 'ai':
+            elif role_lower == 'ai':
                 tag = 'ai'
                 prefix = "AI:"
-            elif role.lower() == 'comment':
+            elif role_lower == 'comment':
                 tag = 'comment'
                 prefix = "[Comment]"
-            elif role.lower() == 'game':
+            elif role_lower == 'game':
                 tag = 'game'
                 prefix = "[Game]"
+            elif role_lower == 'inject':
+                tag = 'inject'
+                prefix = "[Inject]"
+            elif level == 'debug':
+                tag = 'debug'
+                prefix = f"[{role}]"
+            else:
+                tag = 'system'
+                prefix = f"[{role}]"
 
             self.log_text.insert(tk.END, f"{prefix} {message}\n", tag)
             self.log_text.see(tk.END)
@@ -334,10 +425,14 @@ class MainWindow:
         self.root.after(0, update)
 
     def _clear_log(self):
-        """ログクリア"""
+        """ログクリア（通常 Log + VLM Log の両方）"""
         self.log_text.config(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
+
+        self._vlm_log_text.config(state=tk.NORMAL)
+        self._vlm_log_text.delete(1.0, tk.END)
+        self._vlm_log_text.config(state=tk.DISABLED)
 
     # ── VLM Control ──
 
@@ -351,6 +446,11 @@ class MainWindow:
     def _start_vlm(self):
         """VLMBridge作成+起動"""
         from modules.vlm_bridge import VLMBridge
+
+        # VLM Log 枠を表示（log_frame の直後、button_frame の上に挟まる）
+        self._vlm_log_frame.pack(
+            fill=tk.BOTH, expand=True, pady=(0, 10), after=self._log_frame
+        )
 
         self._vlm_status_label.config(text="Starting...", fg=self.colors['processing'])
         self.add_vlm_log("VLM", "Starting VLM pipeline...")
@@ -381,6 +481,9 @@ class MainWindow:
                 self._vlm_bridge = None
 
             threading.Thread(target=_do_stop, daemon=True).start()
+
+        # VLM Log 枠を畳む（widget は破棄せず内容保持。再 ON で復帰）
+        self._vlm_log_frame.pack_forget()
 
         self._vlm_status_label.config(text="Stopped", fg=self.colors['system'])
 
@@ -523,6 +626,41 @@ class MainWindow:
         self.root.quit()
         self.root.destroy()
 
+    def _open_settings(self):
+        """Settings ダイアログを開く。"""
+        from ui.settings_dialog import SettingsDialog
+        SettingsDialog(
+            self.root,
+            on_saved=self._on_settings_saved,
+            colors=self.colors,
+        )
+
+    def _on_settings_saved(self):
+        """Settings 保存後のコールバック。Restart needed ラベルを表示する。"""
+        # 既に表示中なら何もしない（pack_info は管理対象でない場合 KeyError）
+        try:
+            self._restart_needed_label.pack_info()
+        except tk.TclError:
+            self._restart_needed_label.pack(side=tk.RIGHT, padx=(0, 10))
+
+    def _bring_to_front_once(self):
+        """起動直後に Eve UI を最前面に持ち上げる（VTube Studio フォーカス対策）。
+
+        VTS / VOICEVOX が起動時に最前面を奪うので、Eve UI を一瞬 topmost にして
+        前に出した後、すぐ topmost を解除して通常ウィンドウに戻す。
+        """
+        try:
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.focus_force()
+            # 800ms 後に topmost を解除（常時最前面ではなく、起動時のみ最前面化）
+            self.root.after(800, lambda: self.root.attributes('-topmost', False))
+        except Exception:
+            # ウィンドウが既に閉じられている等の競合に備えて握り潰し
+            pass
+
     def run(self):
         """UIメインループ開始"""
+        # 2.5 秒後に最前面化を発火（VTS/VOICEVOX 起動の落ち着き待ち）
+        self.root.after(2500, self._bring_to_front_once)
         self.root.mainloop()

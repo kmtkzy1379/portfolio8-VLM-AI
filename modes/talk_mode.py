@@ -13,7 +13,7 @@ from .base_mode import BaseMode
 class TalkMode(BaseMode):
     """対話モード：マイク入力 + 無言処理"""
     
-    def __init__(self, log_callback: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, log_callback: Optional[Callable[[str, str, str], None]] = None):
         super().__init__(TALK_SYSTEM_PROMPT, log_callback)
         self.stt: Optional[STTHandler] = None
         self.mic: Optional[AudioInput] = None
@@ -34,7 +34,7 @@ class TalkMode(BaseMode):
         await super().initialize()
 
         # STT初期化
-        self.log("System", "DEBUG: Creating STTHandler...")
+        self.log("System", "DEBUG: Creating STTHandler...", level="debug")
         self.stt = STTHandler()
 
         # マイク初期化（音声開始時のコールバック設定）
@@ -42,10 +42,10 @@ class TalkMode(BaseMode):
             self.interrupt()
             self.state["last_user_event_ts"] = time.time()
 
-        self.log("System", "DEBUG: Creating AudioInput...")
+        self.log("System", "DEBUG: Creating AudioInput...", level="debug")
         self.mic = AudioInput(callback_on_speech_start=on_speech_start)
 
-        self.log("System", "DEBUG: Starting mic stream...")
+        self.log("System", "DEBUG: Starting mic stream...", level="debug")
         self.mic.start()
 
         # 無言処理ループ開始
@@ -131,14 +131,14 @@ class TalkMode(BaseMode):
         並行待ちし、先に完了した方をディスパッチする。
         これにより、ユーザー無言時でも画面変化に即座に反応できる。
         """
-        self.log("System", "Starting Talk Mode main loop...")
+        self.log("System", "Starting Talk Mode main loop...", level="debug")
 
         try:
             while self.running and not self.stop_requested:
                 await self._dispatch_next_event()
 
         except asyncio.CancelledError:
-            self.log("System", "Talk Mode cancelled")
+            self.log("System", "Talk Mode cancelled", level="debug")
         except Exception as e:
             self.log("System", f"Error in Talk Mode: {e}")
 
