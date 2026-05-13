@@ -99,15 +99,35 @@ class DeltaEncoder:
                 continue  # Already handled above
 
             prev = self._last_reported.get(eid)
-            changed = self._compute_delta(feat, prev)
-            if changed:
+
+            # Lifetime gate: 初報告 entity が短命なら updated 側でもスキップ。
+            # new_ids ループでスキップされた entity は次フレーム以降ここに来るので、
+            # ここで再評価しないと「閾値を 1 フレームだけ遅らせる」効果しか出ない。
+            if prev is None and self._min_lifetime > 0:
+                entity = tracking_state.entities.get(eid)
+                if entity is not None and entity.frames_alive < self._min_lifetime:
+                    continue
+
+            if prev is None:
+                # 閾値を超えて初報告 → is_new=True で出す (自然な扱い)
                 delta = EntityDelta(
                     track_id=eid,
                     class_name=feat.attributes.get("class", "unknown"),
-                    changed_fields=changed,
+                    changed_fields=self._all_fields(feat),
+                    is_new=True,
                 )
                 deltas.append(delta)
                 self._last_reported[eid] = feat
+            else:
+                changed = self._compute_delta(feat, prev)
+                if changed:
+                    delta = EntityDelta(
+                        track_id=eid,
+                        class_name=feat.attributes.get("class", "unknown"),
+                        changed_fields=changed,
+                    )
+                    deltas.append(delta)
+                    self._last_reported[eid] = feat
 
         # Lost entities
         for eid in tracking_state.lost_ids:
@@ -201,9 +221,13 @@ class DeltaEncoder:
         """
         lines: list[str] = []
 
-        # Scene line
-        scene = delta.scene_label or "unknown"
-        lines.append(f"SCENE: {scene} | change={delta.change_level.name.lower()}")
+        # Scene line: scene_label が None のときは "unknown" を出さず、
+        # change のみ出力する。LLM が「unknown」に過剰反応するのを防ぐ。
+        change_str = delta.change_level.name.lower()
+        if delta.scene_label:
+            lines.append(f"SCENE: {delta.scene_label} | change={change_str}")
+        else:
+            lines.append(f"CHANGE: {change_str}")
 
         # Count entities
         new_count = sum(1 for d in delta.entity_deltas if d.is_new)

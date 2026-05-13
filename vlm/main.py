@@ -574,8 +574,12 @@ class Pipeline:
                 )
 
                 # ── Stage 8: Prefrontal - Delta encoding ──
+                scene_label = self._heuristic_scene_label(
+                    features, change_level, area_ratio
+                )
                 delta = self._delta_encoder.encode(
                     tracking_state, features, change_level,
+                    scene_label=scene_label,
                     timestamp_ms=frame.metadata.timestamp_ms,
                     change_magnitude_avg=cm_avg,
                     change_magnitude_max=cm_max,
@@ -651,6 +655,47 @@ class Pipeline:
             self._shutdown()
 
     # ── Helpers ──
+
+    def _heuristic_scene_label(
+        self,
+        features: dict,
+        change_level: ChangeLevel,
+        area_ratio: float,
+    ) -> Optional[str]:
+        """軽量ヒューリスティックで scene_label を決める。
+
+        - 検出 entity なし: "static" (変化が小さい) / "transitioning" (大変化)
+        - person が支配的: "person-focused"
+        - 複数クラスが混在: "multi-entity"
+        - 単一非 person クラスが支配的: "{class}-dominant"
+
+        外部モデル無し。あくまで参考シグナルで、narration LLM 側で過信しない指示済み。
+        """
+        try:
+            if not features:
+                if change_level == ChangeLevel.MAJOR or area_ratio > 0.3:
+                    return "transitioning"
+                return "static"
+
+            class_counts: dict[str, int] = {}
+            for feat in features.values():
+                cls = feat.attributes.get("class", "unknown") if hasattr(feat, "attributes") else "unknown"
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+
+            if not class_counts:
+                return "static"
+
+            total = sum(class_counts.values())
+            top_class, top_count = max(class_counts.items(), key=lambda kv: kv[1])
+            top_share = top_count / total if total > 0 else 0.0
+
+            if top_class == "person" and top_share >= 0.5:
+                return "person-focused"
+            if top_share >= 0.7:
+                return f"{top_class}-dominant"
+            return "multi-entity"
+        except Exception:
+            return None
 
     def _should_narrate(self, change_level: ChangeLevel) -> bool:
         has_entity_deltas = any(

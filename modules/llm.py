@@ -663,12 +663,14 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         try:
             # Phase 3: tool_call対応の2段階生成
-            # VLMが起動中かつVisionBufferにデータがある場合のみtoolを有効化
+            # VLM bridge が接続+running なら tool を有効化する。
+            # buffer 空でも get_screen_image は _latest_frame_image 経由で
+            # 取れるため、buffer 件数で gate しない。get_screen_info は内部で
+            # "画面情報なし..." を返すので安全。
             use_tools = (
                 self._vision_tools_enabled
-                and self._vlm_bridge
+                and self._vlm_bridge is not None
                 and self._vlm_bridge.is_running
-                and len(self._vlm_bridge.vision_buffer) > 0
             )
 
             print(f"[DEBUG] generate_stream: use_tools={use_tools}, provider={self._provider}, model={self.model}, "

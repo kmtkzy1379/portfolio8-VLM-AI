@@ -209,7 +209,12 @@ class VLMBridge:
             return self._latest_narration
 
     def get_detailed_info(self, n: int = 5) -> str:
-        """Function Calling用: 詳細な視覚情報テキストを返す（Step 6 自然言語化済み）"""
+        """Function Calling用: 詳細な視覚情報テキストを返す。
+
+        ナレーション履歴 + 直近フレームの構造化情報 (VisionMeta) を
+        合成して返す。応答 LLM が「注視」する際にエンティティ関係や
+        timeline など低レベル情報も参照できる。
+        """
         frames = self.vision_buffer.get_recent_frames(n=n)
         if not frames:
             return "画面情報なし（VLMが未起動またはデータなし）"
@@ -221,6 +226,49 @@ class VLMBridge:
             time_label = VisionBuffer._format_age(age)
             tag = f.change_tag.upper()
             lines.append(f"[{time_label}/{tag}] {f.narration}")
+
+        # 直近フレームの構造化情報を ~500 char 上限で追加
+        latest = frames[0] if frames else None
+        meta = getattr(latest, "meta", None) if latest is not None else None
+        if meta is not None:
+            struct_lines: list[str] = ["", "[構造化情報 — 直近フレーム]"]
+            cl_name = getattr(meta, "change_level_name", "") or ""
+            if cl_name:
+                struct_lines.append(f"CHANGE_LEVEL: {cl_name}")
+
+            n_new = getattr(meta, "n_entity_new", 0)
+            n_lost = getattr(meta, "n_entity_lost", 0)
+            n_chg = getattr(meta, "n_entity_changed", 0)
+            if (n_new + n_lost + n_chg) > 0:
+                struct_lines.append(
+                    f"ENTITIES: {n_chg} changed, {n_new} new, {n_lost} lost"
+                )
+
+            n_rel_add = getattr(meta, "n_relation_added", 0)
+            n_rel_rem = getattr(meta, "n_relation_removed", 0)
+            if (n_rel_add + n_rel_rem) > 0:
+                struct_lines.append(
+                    f"RELATION_CHANGES: +{n_rel_add} / -{n_rel_rem}"
+                )
+
+            relations_text = (getattr(meta, "relations_text", "") or "").strip()
+            if relations_text:
+                struct_lines.append(f"RELATIONS: {relations_text[:200]}")
+
+            entity_delta_text = (getattr(meta, "entity_delta_text", "") or "").strip()
+            if entity_delta_text:
+                struct_lines.append(f"TIMELINE: {entity_delta_text[:200]}")
+
+            memory_text = (getattr(meta, "memory_text", "") or "").strip()
+            if memory_text:
+                struct_lines.append(f"MEMORY: {memory_text[:120]}")
+
+            # 全体 500 char 上限で truncate
+            struct_block = "\n".join(struct_lines)
+            if len(struct_block) > 500:
+                struct_block = struct_block[:500] + "..."
+            lines.append(struct_block)
+
         return "\n".join(lines)
 
     def get_latest_screenshot_jpeg(self) -> Optional[bytes]:

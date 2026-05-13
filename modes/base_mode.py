@@ -114,6 +114,11 @@ class BaseMode(ABC):
         self._feedback_task = asyncio.create_task(self.feedback.start_loop())
 
         self.running = True
+
+        # Race-safe: set_vlm_bridge() が initialize() 中に呼ばれて
+        # self.llm が None だった場合の自動再適用。
+        self._apply_pending_vlm_bridge()
+
         self.log("System", "Initialization complete")
 
     async def shutdown(self):
@@ -377,20 +382,59 @@ class BaseMode(ABC):
         pass
 
     def set_vlm_bridge(self, bridge) -> None:
-        """VLMBridgeを接続"""
+        """VLMBridgeを接続/解除する。
+
+        Race-safe: self.llm がまだ None (initialize() 進行中) でも壊れない。
+        その場合は self.vlm_bridge にだけ保存され、initialize() 末尾で
+        再適用される。bridge=None も明示的に伝搬し、LLM 側の tools を
+        正しく無効化する (停止時のリーク防止)。
+
+        差し替え時は古い bridge の auto-push callback を必ず解除する。
+        """
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        # 古い bridge の callback を解除 (異なる bridge への差し替え or None 化時)
+        old_bridge = self.vlm_bridge
+        if old_bridge is not None and old_bridge is not bridge:
+            try:
+                old_bridge.set_auto_push_callback(None)
+            except Exception as e:
+                _logger.warning("old bridge clear callback failed: %s", e)
+
         self.vlm_bridge = bridge
 
-        # Auto-push callback登録
+        # 新しい bridge に callback 登録
         if bridge is not None:
-            bridge.set_auto_push_callback(self._on_vision_auto_push)
+            try:
+                bridge.set_auto_push_callback(self._on_vision_auto_push)
+            except Exception as e:
+                _logger.warning("set_auto_push_callback failed: %s", e)
 
-            # LLMにvision componentsを設定（Phase 3）
-            if hasattr(self.llm, 'set_vision_components'):
+        # LLM 側に伝搬。bridge=None でも set_vision_components(None) を呼ぶ。
+        if self.llm is not None and hasattr(self.llm, 'set_vision_components'):
+            try:
                 self.llm.set_vision_components(bridge)
+            except Exception as e:
+                _logger.warning("set_vision_components failed: %s", e)
+        else:
+            # initialize() 完了前に呼ばれた場合: self.vlm_bridge に残しておき、
+            # initialize() 末尾で _apply_pending_vlm_bridge() が再適用する。
+            _logger.info("set_vlm_bridge: llm not ready yet, will reapply after initialize()")
 
         # フィードバックループにも同じ bridge を共有 (VLM フレームを取り込むため)
         if self.feedback is not None:
             self.feedback.set_vlm_bridge(bridge)
+
+    def _apply_pending_vlm_bridge(self) -> None:
+        """initialize() 末尾で呼び、set_vlm_bridge() が初期化中に空振りした場合の
+        再適用を行う。すでに self.vlm_bridge が None なら何もしない。
+        """
+        if self.vlm_bridge is None:
+            return
+        # 自分自身を再度通すことで llm/feedback 両方に確実に伝搬する。
+        # 既存 callback の再登録は VLMBridge 側が単純上書きなので副作用なし。
+        self.set_vlm_bridge(self.vlm_bridge)
 
     def _on_vision_auto_push(self, vision_frame) -> None:
         """VLMBridge auto-push callback (called from VLM thread).

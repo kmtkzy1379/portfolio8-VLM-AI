@@ -129,6 +129,8 @@ class MainWindow:
         # メインコンテンツ
         main_frame = tk.Frame(self.root, bg=self.colors['bg'])
         main_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        # _create_widgets 末尾で pack_propagate(False) を設定するため保持
+        self._main_frame = main_frame
 
         # モード選択フレーム
         mode_frame = tk.LabelFrame(
@@ -175,14 +177,16 @@ class MainWindow:
         vlm_inner = tk.Frame(vlm_frame, bg=self.colors['frame_bg'])
         vlm_inner.pack(fill=tk.X, padx=15, pady=8)
 
+        # Note: selectcolor をフレーム背景と同色にして Windows ネイティブの
+        # check glyph 描画競合を避ける。ON/OFF の真実源は隣の status_label に寄せる。
         self._vlm_check = tk.Checkbutton(
             vlm_inner,
-            text="VLM ON/OFF",
+            text="VLM",
             variable=self._vlm_enabled,
             font=('Segoe UI', 10),
             bg=self.colors['frame_bg'],
             fg=self.colors['text'],
-            selectcolor=self.colors['accent'],
+            selectcolor=self.colors['frame_bg'],
             activebackground=self.colors['frame_bg'],
             command=self._on_vlm_toggle
         )
@@ -190,12 +194,16 @@ class MainWindow:
 
         self._vlm_status_label = tk.Label(
             vlm_inner,
-            text="Stopped",
+            text="[OFF] Stopped",
             font=('Segoe UI', 9),
             bg=self.colors['frame_bg'],
             fg=self.colors['system']
         )
         self._vlm_status_label.pack(side=tk.RIGHT)
+
+        # BooleanVar の write trace で [OFF]/[ON] プレフィックスを即座に更新する。
+        # Checkbutton の glyph 描画が失敗してもラベルで状態が一目で分かる。
+        self._vlm_enabled.trace_add('write', self._sync_vlm_label)
 
         # ステータスフレーム
         status_frame = tk.LabelFrame(
@@ -344,6 +352,12 @@ class MainWindow:
         self._vlm_log_text.tag_configure('vlm', foreground='#00796B')
         self._vlm_log_text.tag_configure('vlm_error', foreground='#D32F2F')
 
+        # 初期レイアウトを確定させてから main_frame のサイズ伝播を抑止する。
+        # これで _vlm_log_frame の後付け pack/forget でもウィンドウ高さが
+        # 変動しない (内部の expand=True で領域分配だけが起きる)。
+        self.root.update_idletasks()
+        self._main_frame.pack_propagate(False)
+
     def _update_indicator(self, status: str):
         """インジケーター更新"""
         self.status_indicator.delete("all")
@@ -436,12 +450,43 @@ class MainWindow:
 
     # ── VLM Control ──
 
+    def _sync_vlm_label(self, *_args):
+        """`_vlm_enabled` BooleanVar の write trace から呼ばれる。
+
+        現在の core status text に [ON]/[OFF] を付け直して表示する。
+        Checkbutton 自体の glyph 描画が失敗してもラベルで状態が分かる。
+        """
+        core = getattr(self, "_vlm_core_status_text", "Stopped")
+        prefix = "[ON]" if self._vlm_enabled.get() else "[OFF]"
+        try:
+            self._vlm_status_label.config(text=f"{prefix} {core}")
+        except tk.TclError:
+            # ウィジェット破棄後など
+            pass
+
+    def _set_vlm_status(self, core: str, color_key: str) -> None:
+        """VLM status の core テキストと色を更新する。
+
+        _sync_vlm_label が prefix を補完するので、core 単体を受け取る。
+        """
+        self._vlm_core_status_text = core
+        try:
+            self._vlm_status_label.config(fg=self.colors[color_key])
+        except tk.TclError:
+            pass
+        self._sync_vlm_label()
+
     def _on_vlm_toggle(self):
         """VLMチェックボックス変更時"""
         if self._vlm_enabled.get():
             self._start_vlm()
         else:
             self._stop_vlm()
+        # Tk の pending draw を即フラッシュ。初回 ON の glyph 描画競合を緩和。
+        try:
+            self._vlm_check.update_idletasks()
+        except tk.TclError:
+            pass
 
     def _start_vlm(self):
         """VLMBridge作成+起動"""
@@ -452,7 +497,7 @@ class MainWindow:
             fill=tk.BOTH, expand=True, pady=(0, 10), after=self._log_frame
         )
 
-        self._vlm_status_label.config(text="Starting...", fg=self.colors['processing'])
+        self._set_vlm_status("Starting...", 'processing')
         self.add_vlm_log("VLM", "Starting VLM pipeline...")
 
         self._vlm_bridge = VLMBridge()
@@ -467,36 +512,68 @@ class MainWindow:
         self._poll_vlm_status()
 
     def _stop_vlm(self):
-        """VLM停止"""
-        if self._vlm_bridge:
+        """VLM停止。
+
+        race-safe: 停止対象を local 変数に捕捉し、self._vlm_bridge は UI スレッドで
+        即 None 化する。直後に _start_vlm() が呼ばれて新しい bridge が作られても、
+        停止スレッドは古い bridge にしか触らない。
+        """
+        bridge = self._vlm_bridge
+        if bridge is not None:
             self.add_vlm_log("VLM", "Stopping VLM pipeline...")
 
-            # Disconnect from current mode (via setter to clear LLM vision state)
+            # Disconnect from current mode (via setter to clear LLM vision state +
+            # old bridge の auto-push callback も解除される)
             if self.current_mode:
-                self.current_mode.set_vlm_bridge(None)
+                try:
+                    self.current_mode.set_vlm_bridge(None)
+                except Exception as e:
+                    self.add_vlm_log("VLM_Error", f"disconnect failed: {e}")
 
-            # Stop in background thread to avoid blocking UI
-            def _do_stop():
-                self._vlm_bridge.stop()
-                self._vlm_bridge = None
+            # UI スレッドで即 None 化 → 後続の _start_vlm() と干渉しない
+            self._vlm_bridge = None
+
+            # Stop in background thread to avoid blocking UI.
+            # bridge は default arg で固定して、self の状態に依存しない。
+            def _do_stop(b=bridge):
+                try:
+                    b.stop()
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning("VLM stop failed: %s", e)
 
             threading.Thread(target=_do_stop, daemon=True).start()
 
         # VLM Log 枠を畳む（widget は破棄せず内容保持。再 ON で復帰）
         self._vlm_log_frame.pack_forget()
 
-        self._vlm_status_label.config(text="Stopped", fg=self.colors['system'])
+        self._set_vlm_status("Stopped", 'system')
 
     def _poll_vlm_status(self):
-        """500msポーリングでVLMステータスをUI更新"""
+        """500msポーリングでVLMステータスをUI更新 + 必要なら再接続 heal。"""
         if self._vlm_bridge and self._vlm_bridge.is_running:
-            self._vlm_status_label.config(text="Running", fg=self.colors['ready'])
+            self._set_vlm_status("Running", 'ready')
+
+            # Heal: pipeline が起動完了したが現 mode の LLM 側 bridge 参照が
+            # 食い違っているなら再接続を 1-shot で試みる (race recovery)。
+            mode = self.current_mode
+            if mode is not None:
+                llm = getattr(mode, "llm", None)
+                if llm is not None:
+                    bridge_on_llm = getattr(llm, "_vlm_bridge", None)
+                    if bridge_on_llm is not self._vlm_bridge:
+                        try:
+                            mode.set_vlm_bridge(self._vlm_bridge)
+                            self.add_vlm_log("VLM", "Reconnected bridge to current mode")
+                        except Exception as e:
+                            self.add_vlm_log("VLM_Error", f"reconnect failed: {e}")
+
             self.root.after(500, self._poll_vlm_status)
         elif self._vlm_enabled.get() and self._vlm_bridge:
             # Still starting up
             self.root.after(500, self._poll_vlm_status)
         else:
-            self._vlm_status_label.config(text="Stopped", fg=self.colors['system'])
+            self._set_vlm_status("Stopped", 'system')
             # Uncheck if it stopped unexpectedly
             if self._vlm_enabled.get() and not self._vlm_bridge:
                 self._vlm_enabled.set(False)
@@ -556,8 +633,11 @@ class MainWindow:
             # 初期化
             await self.current_mode.initialize()
 
-            # VLMが動作中なら接続
-            if self._vlm_bridge and self._vlm_bridge.is_running:
+            # VLMBridge が存在すれば接続 (is_running を待たない)。
+            # set_vlm_bridge() は内部で safe に処理し、pipeline が後から
+            # Running になっても _poll_vlm_status() の heal チェックが
+            # 必要なら再接続する。
+            if self._vlm_bridge:
                 self.current_mode.set_vlm_bridge(self._vlm_bridge)
 
             self.set_status('ready', 'Running')

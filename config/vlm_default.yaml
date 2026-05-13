@@ -34,7 +34,7 @@ detection:
 tracking:
   tracker: "botsort"                        # tracker type
   tracker_config: "config/botsort_reid.yaml" # custom BoT-SORT with Re-ID
-  min_hits: 5              # detections before track is confirmed (3→5)
+  min_hits: 7              # detections before track is confirmed (5→7: フリッカー抑制)
   max_entities: 100        # hard limit on simultaneous tracks
 
 analysis:
@@ -88,7 +88,7 @@ aggregation:
   min_movement_threshold: 10 # ignore moves below N pixels
   batch_frames: 1           # accumulate N frames before LLM call
   max_tokens: 4000          # total token budget per LLM call
-  min_entity_lifetime: 12   # min frames_alive before reporting entity (8→12)
+  min_entity_lifetime: 15   # min frames_alive before reporting entity (12→15: フリッカー抑制)
 
 narration:
   model: "groq/meta-llama/llama-4-scout-17b-16e-instruct"
