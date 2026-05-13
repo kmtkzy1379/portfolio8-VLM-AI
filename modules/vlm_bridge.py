@@ -209,7 +209,7 @@ class VLMBridge:
             return self._latest_narration
 
     def get_detailed_info(self, n: int = 5) -> str:
-        """Function Calling用: 詳細な視覚情報テキストを返す"""
+        """Function Calling用: 詳細な視覚情報テキストを返す（Step 6 自然言語化済み）"""
         frames = self.vision_buffer.get_recent_frames(n=n)
         if not frames:
             return "画面情報なし（VLMが未起動またはデータなし）"
@@ -217,9 +217,10 @@ class VLMBridge:
         now = time.time()
         lines = []
         for f in frames:
-            age = int(now - f.timestamp)
+            age = max(0.0, now - f.timestamp)
+            time_label = VisionBuffer._format_age(age)
             tag = f.change_tag.upper()
-            lines.append(f"[{age}s前/{tag}] {f.narration}")
+            lines.append(f"[{time_label}/{tag}] {f.narration}")
         return "\n".join(lines)
 
     def get_latest_screenshot_jpeg(self) -> Optional[bytes]:

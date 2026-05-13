@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+from collections import deque
 from typing import Optional
 from groq import AsyncGroq
 from openai import AsyncOpenAI
@@ -288,6 +290,16 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # 沈黙サマリ (ConversationCache.get_silence_summary の戻り値)。
         # recent_turns から「…」を除外したため、その情報を別経路で AI1 に渡す。
         self.silence_summary: Optional[dict] = None
+        # Step 2: 一回限りの追加コンテキスト（中断マーカー等）。
+        # _build_system_prompt で展開後に空文字でクリアされる。
+        # vlm_context は process_input 内で毎ターン上書きされるため、別枠が必要。
+        self.one_shot_context: str = ""
+
+        # Step 5: VLM alerts（MAJOR/MODERATE 変化通知）。
+        # vlm_context は毎ターン上書きされるため、_vlm_alerts は別フィールドで保持し、
+        # _build_system_prompt で別個に明示合成する。
+        # 各要素は (timestamp: float, narration: str, change_tag: str)
+        self._vlm_alerts: deque = deque(maxlen=5)
 
         # Phase 3: Vision components
         self._vlm_bridge = None
@@ -337,6 +349,44 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         self._vlm_bridge = vlm_bridge
         self._vision_tools_enabled = vlm_bridge is not None
         logger.info("Vision tools %s for LLM", "enabled" if self._vision_tools_enabled else "disabled")
+
+    def append_vlm_alert(self, vision_frame) -> None:
+        """VLM alert を _vlm_alerts に蓄積（メインループ内から呼ぶ）。
+
+        Step 5: VLM スレッドからは BaseMode._on_vision_auto_push が
+        loop.call_soon_threadsafe で _on_vision_alert_main を呼び、
+        そこから本メソッドが実行される。deque 操作はメインループ内で安全。
+        """
+        try:
+            ts = float(getattr(vision_frame, "timestamp", time.time()))
+            narration = str(getattr(vision_frame, "narration", "") or "")
+            tag = str(getattr(vision_frame, "change_tag", "") or "")
+            self._vlm_alerts.append((ts, narration, tag))
+        except Exception as e:
+            logger.warning("append_vlm_alert failed: %s", e)
+
+    def has_unseen_vlm_alerts(self, since_ts: float) -> bool:
+        """since_ts 以降の VLM alert が存在するか（idle ellipsis loop 用）。"""
+        return any(ts > since_ts for ts, _, _ in self._vlm_alerts)
+
+    @staticmethod
+    def _format_alert_age(seconds: float) -> str:
+        """経過秒を自然言語化（Step 5 / 6 共通）"""
+        if seconds < 3:
+            return "たった今"
+        if seconds < 60:
+            return f"{int(seconds)}秒前"
+        if seconds < 3600:
+            return f"{int(seconds // 60)}分前"
+        return f"{int(seconds // 3600)}時間前"
+
+    def _format_alert(self, alert: tuple) -> str:
+        """alert (ts, narration, tag) を「[たった今/MAJOR] narration」形式に整形"""
+        ts, narration, tag = alert
+        age = max(0.0, time.time() - ts)
+        age_str = self._format_alert_age(age)
+        tag_str = tag.upper() if tag else "ALERT"
+        return f"[{age_str}/{tag_str}] {narration}"
 
     def _build_system_prompt(self, user_text: str) -> str:
         """システムプロンプトを動的再構築"""
@@ -448,14 +498,34 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 if gl:
                     goal_block += f"[長期方針]: {gl}\n"
 
+        # Step 5: VLM alerts (MAJOR/MODERATE 変化通知の蓄積、別フィールド)
+        # vlm_context は毎ターン上書きされるため、_vlm_alerts を独立合成する。
+        vlm_alerts_block = ""
+        if self._vlm_alerts:
+            alert_lines = "\n".join(self._format_alert(a) for a in self._vlm_alerts)
+            vlm_alerts_block = (
+                "\n[Vision Alerts (recent)]:\n"
+                "以下は直近の画面変化通知です。タイムスタンプを見て、新しい変化なら自然に触れて、\n"
+                "古いものは無視してください（数秒前なら触れる、1分以上前なら基本スルー）。\n"
+                f"{alert_lines}\n"
+            )
+
+        # Step 2: one_shot_context (中断マーカー等の一回限り情報)
+        # vlm_context とは独立に保持される。展開後は空文字でクリアされる。
+        one_shot_block = ""
+        if self.one_shot_context:
+            one_shot_block = f"\n[一時情報]: {self.one_shot_context}\n"
+            self.one_shot_context = ""  # 一回限り消費
+
         # 組み立て
         base_content = self.system_prompt
         if "# Start Conversation" in base_content:
             base_content = base_content.split("# Start Conversation")[0].rstrip()
 
         combined = (
-            ai2_context + vlm_context_str + vision_hint
+            ai2_context + vlm_context_str + vlm_alerts_block + vision_hint
             + rag_context + silence_context + recent_context + goal_block
+            + one_shot_block
         )
 
         # Inject ログ: 何が AI1 に注入されたかを Show debug 時に UI に流す。

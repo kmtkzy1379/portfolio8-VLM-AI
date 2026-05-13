@@ -4,6 +4,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import Callable, Optional
 from colorama import Fore
 
@@ -12,6 +13,19 @@ from modules import (
     LLMHandler, TTSHandler, AudioPlayer,
     FeedbackHandler, RAGHandler, ConversationCache
 )
+
+
+class ResponseStage(Enum):
+    """応答パイプラインの進行ステージ。
+
+    入力2 到着時のマージ判断や is_speaking() 判定に使う。
+    STT は独立 AudioListener に分離されたためステージから除外。
+    """
+    IDLE = auto()
+    LLM_PENDING = auto()
+    LLM_STREAMING = auto()
+    TTS_QUEUED = auto()
+    TTS_PLAYING = auto()
 
 
 class BaseMode(ABC):
@@ -41,15 +55,25 @@ class BaseMode(ABC):
         # VLM bridge (optional)
         self.vlm_bridge = None
 
-        # Vision auto-push queue (Phase 2)
-        self._vision_push_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
-
         # asyncio event loop reference (set in initialize(), used for thread-safe queue ops)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # 内部タスク
         self._player_task: Optional[asyncio.Task] = None
         self._feedback_task: Optional[asyncio.Task] = None
+
+        # Step 1: 応答パイプラインのステージ管理
+        # - _stage: 現在の応答ステージ (Step 1 では観測のみ、Step 4 で is_speaking() に使う)
+        # - _current_response_task: process_input の Task 化 (Step 2 で実装)
+        # - _response_lock: 同時応答実行を排除 (Step 2)
+        # - _pending_input_queue: AudioListener が STT 結果を入れるキュー
+        # - _pending_lock / _pending_input: マージ判断用 (Step 4)
+        self._stage: ResponseStage = ResponseStage.IDLE
+        self._current_response_task: Optional[asyncio.Task] = None
+        self._response_lock: asyncio.Lock = asyncio.Lock()
+        self._pending_input_queue: asyncio.Queue = asyncio.Queue()
+        self._pending_lock: asyncio.Lock = asyncio.Lock()
+        self._pending_input: Optional[str] = None
 
     async def initialize(self):
         """共通コンポーネントの初期化"""
@@ -58,6 +82,8 @@ class BaseMode(ABC):
 
         # コンポーネント初期化
         self.player = AudioPlayer()
+        # Step 2: AudioPlayer にメインループを渡す（別スレッドからの interrupt() 用）
+        self.player.set_loop(self._loop)
         self.llm = LLMHandler()
         self.tts = TTSHandler()
         self.rag = RAGHandler()
@@ -137,25 +163,76 @@ class BaseMode(ABC):
 
     async def process_input(self, input_text: str) -> str:
         """
-        テキスト入力を処理してAI応答を生成
+        テキスト入力を処理してAI応答を生成（外部 API は完全互換）。
+
+        Step 2: 内部で cancel 可能な Task を保持しつつ、必ず await で str を返す。
+        - Task 即 return は禁止（game_mode/youtube_mode の `await self.process_input(...)` を維持）
+        - `_response_lock` で同時応答実行を排除（length-based history rollback の安全性）
+        - 直前の task が生存中なら cancel + 完了待ちしてから新しい応答を開始
 
         Args:
             input_text: 入力テキスト
 
         Returns:
-            AI応答テキスト
+            AI応答テキスト（cancel 時は空文字列）
+        """
+        if self.stop_requested or not self.running:
+            return ""
+
+        # 直前の task が生存中なら cancel + 完了待ち（_response_lock を取る前）
+        await self._cancel_current_response_if_any()
+
+        # 単一応答保証: 同時に複数の _run_response_pipeline が走らないようにする
+        async with self._response_lock:
+            self._current_response_task = asyncio.create_task(
+                self._run_response_pipeline(input_text)
+            )
+            try:
+                # 必ず await で完了待ち（Task 即 return 禁止）
+                return await self._current_response_task
+            except asyncio.CancelledError:
+                # 外部 cancel 伝播時は空応答返却（呼び出し側コードを壊さない）
+                return ""
+            finally:
+                self._current_response_task = None
+
+    async def _cancel_current_response_if_any(self) -> None:
+        """直前の応答 task が生存中なら cancel + 完了待ち（タイムアウト 2.0 秒）。"""
+        task = self._current_response_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            self.log("System", "Cancel timeout - forcing continue", level="debug")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _run_response_pipeline(self, input_text: str) -> str:
+        """応答パイプライン本体（Task 化されて cancel 可能）。
+
+        - 入口で `history_len_before = len(self.llm.history)` を snapshot
+        - cancel 時は length-based restore で history を完全 rollback（user/assistant/tool すべて削除）
+        - cancel 時に TTS 完了レース対策で `player.queue` を drain
+        - finally で `_stage = IDLE` に戻す
         """
         if self.stop_requested or not self.running:
             return ""
 
         self.is_processing = True
+        self._stage = ResponseStage.LLM_PENDING
+        history_len_before = len(self.llm.history)
+        pending_tts_tasks: list[asyncio.Task] = []
         start_time = time.time()
 
         try:
             self.log("User", input_text)
 
-            # 会話キャッシュに追加
-            await self.conversation_cache.add_user_message(input_text)
+            # Step 3: ConversationCache への記録は正常完了時のみ atomic に行う
+            # （cancel 時に user だけ残る穴を防ぐため、ここでは add_user_message しない）
 
             # RAG検索（800msタイムアウト）
             rag_memories = []
@@ -209,7 +286,11 @@ class BaseMode(ABC):
                 for wav in wavs:
                     if wav and not isinstance(wav, Exception):
                         self.player.add_to_queue(wav)
+                # TTS が player.queue に積まれたら TTS_QUEUED へ遷移
+                if self._stage == ResponseStage.LLM_STREAMING and self.player.queue.qsize() > 0:
+                    self._stage = ResponseStage.TTS_QUEUED
 
+            self._stage = ResponseStage.LLM_STREAMING
             async for sentence in self.llm.generate_stream(input_text):
                 if self.stop_requested or self.player.interrupt_signal:
                     break
@@ -226,7 +307,9 @@ class BaseMode(ABC):
             # 応答をログに出力
             if ai_response:
                 self.log("AI", ai_response)
-                await self.conversation_cache.add_ai_response(ai_response)
+                # Step 3: 正常完了時のみ atomic に1ターン記録
+                # cancel 時はここに到達しないため user/ai どちらも記録されない
+                await self.conversation_cache.add_turn(input_text, ai_response)
                 # Phase 4.3.1: 生ターン保存は撤去。
                 # RAG 入力は feedback ループが Episode Summary 経由で行う (rag.add_episode)。
                 # conversation_history.txt は別途 cache 経由で監査用に蓄積される。
@@ -240,8 +323,32 @@ class BaseMode(ABC):
 
             return ai_response
 
+        except asyncio.CancelledError:
+            # cleanup: pending TTS task を確実にキャンセル
+            for t in pending_tts_tasks:
+                if not t.done():
+                    t.cancel()
+            if pending_tts_tasks:
+                await asyncio.gather(*pending_tts_tasks, return_exceptions=True)
+
+            # TTS 完了レース対策: cancel 直前に generate_audio が完了して
+            # player.queue.put_nowait(wav) するレースに備え、queue を破棄
+            while not self.player.queue.empty():
+                try:
+                    self.player.queue.get_nowait()
+                    self.player.queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+
+            # history を完全 restore (user/assistant/tool すべて削除)
+            self.llm.history = self.llm.history[:history_len_before]
+            self.log("System", "[Cancelled] LLM stream aborted, history rolled back", level="debug")
+            # 部分応答は記録しない（add_ai_response 未呼び出しなので OK）
+            raise
+
         finally:
             self.is_processing = False
+            self._stage = ResponseStage.IDLE
             self.on_response_complete()
 
     def log(self, role: str, message: str, level: str = "info"):
@@ -288,62 +395,61 @@ class BaseMode(ABC):
     def _on_vision_auto_push(self, vision_frame) -> None:
         """VLMBridge auto-push callback (called from VLM thread).
 
-        Uses call_soon_threadsafe to safely enqueue from a non-asyncio thread.
-
-        Args:
-            vision_frame: VisionFrame with importance >= threshold
+        Step 5: 旧経路（_vision_push_queue 経由の独立 process_input）を廃止し、
+        VLM スレッドから loop.call_soon_threadsafe でメインループ上の
+        `_on_vision_alert_main` を呼ぶ。alert は llm._vlm_alerts に蓄積され、
+        次のユーザー応答 or idle 自発 nudge で自然に言及される。
         """
         if self._loop is None or self._loop.is_closed():
             return
         try:
-            self._loop.call_soon_threadsafe(self._enqueue_vision_frame, vision_frame)
+            self._loop.call_soon_threadsafe(self._on_vision_alert_main, vision_frame)
         except RuntimeError:
             # Loop already closed during shutdown
             pass
 
-    def _enqueue_vision_frame(self, vision_frame) -> None:
-        """Enqueue a vision frame from the event loop thread (called via call_soon_threadsafe)."""
-        try:
-            self._vision_push_queue.put_nowait(vision_frame)
-        except asyncio.QueueFull:
-            pass  # Drop if queue is full
+    def _on_vision_alert_main(self, vision_frame) -> None:
+        """VLM alert をメインループ内で処理する（Step 5）。
 
-    async def _handle_vision_push(self, vision_frame) -> None:
-        """VLMからのnudge（MAJOR変化 or watch_mode時MODERATE）を処理。
-
-        vlm_contextにアラートを注入し、通常のprocess_inputで応答を生成。
+        - llm._vlm_alerts に蓄積（独立 process_input は走らない）
+        - feedback.signal_vlm_event() で feedback ループに通知（既存挙動維持）
         """
-        alert = f"★[SCENE/{vision_frame.change_tag.upper()}] {vision_frame.narration}"
-
-        if self.llm:
-            existing = self.llm.vlm_context or ""
-            self.llm.vlm_context = f"{alert}\n{existing}"[:800]
-
-        self.log("System", f"Vision nudge: {alert[:100]}...", level="debug")
-
-        # フィードバックループに VLM イベント通知 (即ウェイク)
-        if self.feedback:
-            self.feedback.signal_vlm_event()
-
-        await self.process_input(
-            f"[内部: 画面変化通知 - 前回と本当に違う場合のみリアクション] {vision_frame.narration[:200]}"
-        )
-
-        # 応答完了後、キューに溜まった残りフレームを破棄（1変化=1応答）
-        drained = 0
-        while not self._vision_push_queue.empty():
-            try:
-                self._vision_push_queue.get_nowait()
-                drained += 1
-            except asyncio.QueueEmpty:
-                break
-        if drained:
-            self.log("System", f"Vision queue drained: {drained} frames skipped", level="debug")
+        try:
+            if self.llm is not None:
+                self.llm.append_vlm_alert(vision_frame)
+            if self.feedback is not None:
+                self.feedback.signal_vlm_event()
+            narration = getattr(vision_frame, "narration", "") or ""
+            self.log(
+                "System",
+                f"Vision alert queued: {narration[:60]}...",
+                level="debug",
+            )
+        except Exception as e:
+            self.log("System", f"_on_vision_alert_main error: {e}", level="debug")
 
     def interrupt(self):
         """音声再生を中断"""
         if self.player:
             self.player.interrupt()
+
+    def is_speaking(self) -> bool:
+        """Eve が発話中（LLM 生成・TTS 生成・TTS 再生のいずれか）かを総合判定。
+
+        Step 4: process_input は再生完了を待たずに返るため、_stage が IDLE に
+        戻った後も player.is_playing == True の状態が確実に存在する。
+        Dispatcher のマージ判断にも使う。
+        """
+        if self._stage in (
+            ResponseStage.LLM_PENDING,
+            ResponseStage.LLM_STREAMING,
+            ResponseStage.TTS_QUEUED,
+            ResponseStage.TTS_PLAYING,
+        ):
+            return True
+        if self.player and (self.player.is_playing or not self.player.queue.empty()):
+            return True
+        return False
 
     @abstractmethod
     async def run(self):

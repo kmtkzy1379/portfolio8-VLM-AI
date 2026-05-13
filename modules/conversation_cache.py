@@ -87,10 +87,28 @@ class ConversationCache:
                 self._write_queue.task_done()
     
     def _append_to_file(self, entry: dict):
-        """ファイルに追記（同期処理）"""
+        """ファイルに追記（同期処理）
+
+        Step 3: `_kind == "turn"` ジョブの場合は既存互換の 2 JSONL 行
+        （user 行 + ai 行）に展開して書く。`initialize()` のパースが
+        「user 行の次に ai 行」を前提に i+=2 で進む形を維持する。
+        """
         try:
-            with open(self.history_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            if entry.get("_kind") == "turn":
+                line1 = json.dumps(
+                    {"timestamp": entry["user_ts"], "user": entry["user"]},
+                    ensure_ascii=False,
+                )
+                line2 = json.dumps(
+                    {"timestamp": entry["ai_ts"], "ai": entry["ai"]},
+                    ensure_ascii=False,
+                )
+                with open(self.history_file, "a", encoding="utf-8") as f:
+                    f.write(line1 + "\n")
+                    f.write(line2 + "\n")
+            else:
+                with open(self.history_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             print(f"File Write Error: {e}")
     
@@ -121,15 +139,44 @@ class ConversationCache:
             "timestamp": timestamp,
             "ai": ai_text
         }
-        
+
         # 最後のターンにAI応答を追加
         async with self._lock:
             if self.turns and self.turns[-1]["ai"] == "":
                 self.turns[-1]["ai"] = ai_text
                 self.turns[-1]["ai_timestamp"] = timestamp
-        
+
         # ファイルに非同期書き込み
         await self._write_queue.put(entry)
+
+    async def add_turn(self, user_text: str, ai_text: str) -> None:
+        """正常完了したターンを atomic に記録する（Step 3）。
+
+        - メモリ層 (self.turns): user/ai ペアを1ターンとして atomic に追加
+        - _write_queue: 1ターン分の書き込みジョブとして enqueue
+        - worker 側 (_append_to_file): 既存互換の 2 JSONL 行に展開して書く
+
+        cancel 時はこのメソッド自体が呼ばれないため、user/ai どちらも記録されない。
+        既存の add_user_message / add_ai_response を併用する経路（feedback 等）は維持。
+        """
+        user_ts = datetime.now().isoformat()
+        ai_ts = datetime.now().isoformat()
+
+        async with self._lock:
+            self.turns.append({
+                "user": user_text,
+                "ai": ai_text,
+                "user_timestamp": user_ts,
+                "ai_timestamp": ai_ts,
+            })
+
+        await self._write_queue.put({
+            "_kind": "turn",
+            "user": user_text,
+            "ai": ai_text,
+            "user_ts": user_ts,
+            "ai_ts": ai_ts,
+        })
     
     async def get_recent_turns(
         self, count: int = 5, exclude_ellipsis: bool = False,

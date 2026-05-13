@@ -102,6 +102,20 @@ class VisionBuffer:
         with self._lock:
             self._buffer.append(frame)
 
+    @staticmethod
+    def _format_age(seconds: float) -> str:
+        """経過秒を自然言語化（Step 6）。
+
+        <3秒: 「たった今」 / <60秒: 「N秒前」 / <3600秒: 「N分前」 / それ以上: 「N時間前」
+        """
+        if seconds < 3:
+            return "たった今"
+        if seconds < 60:
+            return f"{int(seconds)}秒前"
+        if seconds < 3600:
+            return f"{int(seconds // 60)}分前"
+        return f"{int(seconds // 3600)}時間前"
+
     def get_scene_journal(self, n: int = 5, max_age: float = 60.0) -> str:
         """直近n件のナレーションを変化レベル付きジャーナルとして返す
 
@@ -124,8 +138,8 @@ class VisionBuffer:
 
         lines = []
         for f in recent:
-            age = int(now - f.timestamp)
-            time_label = "たった今" if age < 10 else f"{age}秒前"
+            age = max(0.0, now - f.timestamp)
+            time_label = self._format_age(age)
             tag = f.change_tag.upper()
             lines.append(f"[{time_label}/{tag}] {f.narration}")
 
