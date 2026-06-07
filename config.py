@@ -156,6 +156,30 @@ class Config:
     SUMMARY_FILE = "memory_summary.txt"
     RAG_FILE = "rag_memory.jsonl"
 
+    # Plan-and-Execute Task Queue
+    TASK_QUEUE_FILE = os.getenv("TASK_QUEUE_FILE", "tasks.jsonl")
+    TASK_MAX_ACTIVE = int(os.getenv("TASK_MAX_ACTIVE", "3"))
+    PLANNER_ENABLE = os.getenv("PLANNER_ENABLE", "true").lower() == "true"
+    VALIDATOR_ENABLE = os.getenv("VALIDATOR_ENABLE", "true").lower() == "true"
+    VALIDATOR_WATCHDOG_SEC = float(os.getenv("VALIDATOR_WATCHDOG_SEC", "90"))
+    VALIDATOR_REPLAN_THRESHOLD = float(os.getenv("VALIDATOR_REPLAN_THRESHOLD", "0.5"))
+
+    # Step 1.5: AI1 active_instruction ツールと期限管理（timestamp ベース）
+    AI1_INSTRUCTION_TOOL_ENABLE = os.getenv("AI1_INSTRUCTION_TOOL_ENABLE", "true").lower() == "true"
+    ACTIVE_INSTRUCTION_DEFAULT_EXPIRE_SEC = float(os.getenv("ACTIVE_INSTRUCTION_DEFAULT_EXPIRE_SEC", "300"))
+    INSTRUCTION_OVERDUE_GRACE_SEC = float(os.getenv("INSTRUCTION_OVERDUE_GRACE_SEC", "60"))
+    GOAL_CHANGE_MIN_INTERVAL_SEC = float(os.getenv("GOAL_CHANGE_MIN_INTERVAL_SEC", "120"))
+
+    # Idle/silence nudge escalation（無言時の自発発話。ユーザがライブ調整する想定）
+    # カテゴリ判定は ConversationCache.get_silence_summary()["silence_seconds"]
+    # （最後の「実」ユーザ発話起点。Eve の応答発話時間も含むため early は 20s 前後を既定）。
+    IDLE_EARLY_SEC       = float(os.getenv("IDLE_EARLY_SEC", "20"))   # < これ → early（基本「…」）
+    IDLE_LONG_SEC        = float(os.getenv("IDLE_LONG_SEC",  "90"))   # >= これ → long（深い沈黙）
+    # 沈黙 "…" nudge 間の指数バックオフ: min(BASE * FACTOR**n, CAP)
+    IDLE_BASE_SEC        = float(os.getenv("IDLE_BASE_SEC",        "8"))
+    IDLE_BACKOFF_FACTOR  = float(os.getenv("IDLE_BACKOFF_FACTOR",  "1.8"))
+    IDLE_BACKOFF_CAP_SEC = float(os.getenv("IDLE_BACKOFF_CAP_SEC", "90"))
+
 
     @staticmethod
     def validate():

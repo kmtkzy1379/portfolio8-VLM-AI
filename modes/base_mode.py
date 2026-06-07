@@ -75,6 +75,13 @@ class BaseMode(ABC):
         self._pending_lock: asyncio.Lock = asyncio.Lock()
         self._pending_input: Optional[str] = None
 
+        # Plan-and-Execute Task Queue（モードごとに明示的に有効化、デフォルト False）
+        # TalkMode のみ __init__ で True にする。
+        self.task_planning_enabled: bool = False
+        self.task_manager = None
+        self.planner = None
+        self.validator = None
+
     async def initialize(self):
         """共通コンポーネントの初期化"""
         self._loop = asyncio.get_running_loop()
@@ -96,6 +103,9 @@ class BaseMode(ABC):
         # AI2フィードバック用のコールバック設定
         def update_memory_func(memory_text):
             self.llm.ai2_feedback = memory_text[:Config.FB_LOOP_MAX_CHARS]
+            # Step 1.5: 更新時刻も記録（古い参考情報ラベルの経過時間表示用）
+            from datetime import datetime as _dt
+            self.llm._ai2_feedback_set_at = _dt.now().isoformat()
             self.log("System", f"AI2 Feedback Updated ({len(memory_text)} chars)", level="debug")
         self.llm.update_memory = update_memory_func
         self.llm.rag = self.rag
@@ -104,6 +114,8 @@ class BaseMode(ABC):
         self.feedback = FeedbackHandler(self.llm, conversation_cache=self.conversation_cache)
         # Phase 4.3.1: feedback ループから episode を RAG へ保存できるよう注入
         self.feedback.set_rag(self.rag)
+        # Step 1.5: AI1 prompt に「過去の goal 提案履歴」を注入する callable を渡す
+        self.llm.goal_history_provider = self.feedback.get_goal_history_for_prompt
 
         # RAGと会話キャッシュを初期化
         await self.rag.initialize()
@@ -112,6 +124,20 @@ class BaseMode(ABC):
         # バックグラウンドタスク開始
         self._player_task = asyncio.create_task(self.player.play_worker())
         self._feedback_task = asyncio.create_task(self.feedback.start_loop())
+
+        # Plan-and-Execute: TaskManager のみを Step 1 で起動（mode フラグ + global kill switch）
+        # Planner / Validator の生成・注入は後続 Step で追加する。
+        if self.task_planning_enabled and Config.PLANNER_ENABLE:
+            from modules.task_manager import TaskManager
+            self.task_manager = TaskManager(Config.TASK_QUEUE_FILE)
+            await self.task_manager.start()
+            # Step 1.5: llm に TaskManager を注入 + META_TOOLS を有効化（active_instruction ツール）
+            self.llm.set_task_manager(self.task_manager)
+            if Config.AI1_INSTRUCTION_TOOL_ENABLE:
+                self.llm.enable_meta_tools(True)
+            # Fix-4 Phase 1 C2: RAG に TaskManager を注入（active 時の capability_denial penalty 用）
+            if hasattr(self.rag, "set_task_manager"):
+                self.rag.set_task_manager(self.task_manager)
 
         self.running = True
 
@@ -166,13 +192,63 @@ class BaseMode(ABC):
 
         self.log("System", "Shutdown complete")
 
-    async def process_input(self, input_text: str) -> str:
+    # Fix-9b: コミット対象外の非実質発話（相槌・沈黙）。
+    _NONSUBSTANTIVE_FOR_COMMIT = frozenset(
+        {"…", "うん", "うん。", "はい", "あ", "あ。", "ん", "へえ", "そう", "うんうん", "あー", "あーね"}
+    )
+
+    def _maybe_commit_fact(self, input_text: str, ai_response: str, is_internal_nudge: bool) -> None:
+        """Fix-9b: Eve の実質回答を一貫性ストアに記録する（応答完了時, sync 入口）。
+
+        関連 instruction がある実質回答のみ対象。task_manager の command queue に enqueue するだけで、
+        conversation_cache / RAG には一切書かない（Fix-6 保全）。実際の defend/保存は
+        TaskManager._handle_commit_fact が行う（同じ話題に active な答えがあれば最初の答えを守る）。
+        """
+        if self.task_manager is None:
+            return
+        answer = (ai_response or "").strip()
+        if not answer or answer in self._NONSUBSTANTIVE_FOR_COMMIT:
+            return
+        import re as _re
+        instruction_text = ""
+        iid = None
+        m = _re.search(r"\[内部: 期限超過(?:再判定)?\s+(i_[0-9a-f]+)", input_text)
+        if m:
+            # 督促 nudge: instruction id が input_text に埋め込まれている
+            iid = m.group(1)
+            inst = self.task_manager.get_instruction(iid)
+            instruction_text = inst["instruction"] if inst else ""
+        else:
+            # idle / 通常ターン: 非終端 instruction が 1 件だけならそれに帰属（曖昧なら捕捉しない）
+            cands = self.task_manager.get_active_instructions_for_prompt()
+            if len(cands) != 1:
+                return
+            iid = cands[0]["id"]
+            instruction_text = cands[0]["instruction"]
+        if not instruction_text:
+            return
+        topic_norm = self.task_manager._normalize_instruction(instruction_text)
+        if not topic_norm:
+            return
+        self.task_manager.enqueue_command_nowait({
+            "kind": "commit_fact",
+            "scope": "eve",
+            "topic_norm": topic_norm,
+            "answer_text": answer[:120],
+            "instruction_id": iid,
+            "source": "nudge" if is_internal_nudge else "conversation",
+        })
+
+    async def process_input(self, input_text: str, is_internal_nudge: bool = False) -> str:
         """
         テキスト入力を処理してAI応答を生成（外部 API は完全互換）。
 
         Step 2: 内部で cancel 可能な Task を保持しつつ、必ず await で str を返す。
         - Task 即 return は禁止（game_mode/youtube_mode の `await self.process_input(...)` を維持）
         - `_response_lock` で同時応答実行を排除（length-based history rollback の安全性）
+
+        Fix-6 P1-b: is_internal_nudge=True なら内部 nudge として扱う
+        (conversation_cache / LLM history / RAG query を汚染しない)。
         - 直前の task が生存中なら cancel + 完了待ちしてから新しい応答を開始
 
         Args:
@@ -188,9 +264,10 @@ class BaseMode(ABC):
         await self._cancel_current_response_if_any()
 
         # 単一応答保証: 同時に複数の _run_response_pipeline が走らないようにする
+        # Fix-6 P1-b: is_internal_nudge を _run_response_pipeline に伝搬
         async with self._response_lock:
             self._current_response_task = asyncio.create_task(
-                self._run_response_pipeline(input_text)
+                self._run_response_pipeline(input_text, is_internal_nudge=is_internal_nudge)
             )
             try:
                 # 必ず await で完了待ち（Task 即 return 禁止）
@@ -216,13 +293,17 @@ class BaseMode(ABC):
         except Exception:
             pass
 
-    async def _run_response_pipeline(self, input_text: str) -> str:
+    async def _run_response_pipeline(
+        self, input_text: str, is_internal_nudge: bool = False
+    ) -> str:
         """応答パイプライン本体（Task 化されて cancel 可能）。
 
         - 入口で `history_len_before = len(self.llm.history)` を snapshot
         - cancel 時は length-based restore で history を完全 rollback（user/assistant/tool すべて削除）
         - cancel 時に TTS 完了レース対策で `player.queue` を drain
         - finally で `_stage = IDLE` に戻す
+
+        Fix-6 P1-c: is_internal_nudge=True なら 4 箇所 (log/RAG/cache/llm) の汚染防止を有効化。
         """
         if self.stop_requested or not self.running:
             return ""
@@ -234,20 +315,35 @@ class BaseMode(ABC):
         start_time = time.time()
 
         try:
-            self.log("User", input_text)
+            # Fix-6 P1-c (1) ログ表示: User vs Nudge を分ける
+            if is_internal_nudge:
+                self.log("Nudge", input_text[:80] + ("..." if len(input_text) > 80 else ""), level="debug")
+            else:
+                self.log("User", input_text)
 
             # Step 3: ConversationCache への記録は正常完了時のみ atomic に行う
             # （cancel 時に user だけ残る穴を防ぐため、ここでは add_user_message しない）
 
             # RAG検索（800msタイムアウト）
             rag_memories = []
+            rag_query = ""
             try:
                 # Phase 4.3.2: top_k は Config.FB_RAG_TOP_K (default 4) を使う
                 # MMR による多様性確保が効くため top_k 拡大しても重複しない
-                rag_task = asyncio.create_task(self.rag.search_similar(input_text))
-                rag_memories = await asyncio.wait_for(rag_task, timeout=1.5)
-                if rag_memories:
-                    self.log("System", f"RAG found: {len(rag_memories)} memories", level="debug")
+                # Fix-6 P1-c (2) RAG 汚染防止: 内部 nudge は "[内部:...]" を query にしない、
+                # instruction の中身 (末尾の "—" 以降) を抽出して query にする
+                if is_internal_nudge and "—" in input_text:
+                    rag_query = input_text.split("—")[-1].strip().rstrip("]")
+                elif is_internal_nudge:
+                    # VLM nudge や「…」のように "—" を含まない場合は、 RAG search を skip
+                    rag_query = ""
+                else:
+                    rag_query = input_text
+                if rag_query:
+                    rag_task = asyncio.create_task(self.rag.search_similar(rag_query))
+                    rag_memories = await asyncio.wait_for(rag_task, timeout=1.5)
+                    if rag_memories:
+                        self.log("System", f"RAG found: {len(rag_memories)} memories", level="debug")
             except asyncio.TimeoutError:
                 self.log("System", "RAG timeout - proceeding without memories")
             except Exception as e:
@@ -256,11 +352,23 @@ class BaseMode(ABC):
             # RAGと直近ターンをLLMに設定
             # exclude_ellipsis=True: 内部見守り発話「…」を recent_turns から除外
             #   (沈黙時に直前の実会話が押し出される問題への対策)
-            self.llm.rag_memories = rag_memories
+            # Fix(沈黙RAG): 内部 nudge で RAG search を skip した場合（idle「…」, rag_query=""）、
+            # _process_idle_input が事前にセットした random RAG memories（沈黙時の話題タネ）を
+            # [] で上書きして消さない。実際に search した時 / 通常ユーザターン時のみ上書きする。
+            # これが無いと沈黙時に Eve が手札ゼロになり、不自然な無難発話になる。
+            if rag_query or not is_internal_nudge:
+                self.llm.rag_memories = rag_memories
             recent_turns = await self.conversation_cache.get_recent_turns(
                 count=5, exclude_ellipsis=True,
             )
             self.llm.recent_turns = recent_turns
+            # Fix-9b: 一貫性ストア（既にコミットした自分の答え/嗜好）を全経路で注入
+            # （idle / 督促 / 通常ターンは全てこの pipeline を通る）。
+            if self.task_manager is not None:
+                try:
+                    self.llm.committed_facts = self.task_manager.get_committed_facts_for_prompt()
+                except Exception:  # noqa: BLE001
+                    self.llm.committed_facts = []
             # 沈黙サマリ (「…」除外で失われた情報を別経路で AI1 に渡す)
             try:
                 self.llm.silence_summary = (
@@ -296,7 +404,8 @@ class BaseMode(ABC):
                     self._stage = ResponseStage.TTS_QUEUED
 
             self._stage = ResponseStage.LLM_STREAMING
-            async for sentence in self.llm.generate_stream(input_text):
+            # Fix-6 P1-c (3) LLM history 汚染防止: is_internal_nudge を伝搬
+            async for sentence in self.llm.generate_stream(input_text, is_internal_nudge=is_internal_nudge):
                 if self.stop_requested or self.player.interrupt_signal:
                     break
                 ai_response += sentence
@@ -312,9 +421,23 @@ class BaseMode(ABC):
             # 応答をログに出力
             if ai_response:
                 self.log("AI", ai_response)
+                # Fix-9b: コミット事実の捕捉（応答完了時）。conversation_cache/RAG には書かない＝Fix-6 保全。
+                # 内部 nudge ターン（ドリフトが起きる場所）でも捕捉するが、 下の Fix-6 ガード本体には入らない。
+                if self.task_manager is not None:
+                    try:
+                        self._maybe_commit_fact(input_text, ai_response, is_internal_nudge)
+                    except Exception as e:  # noqa: BLE001
+                        self.log("System", f"[CommitFact] capture failed: {e}", level="debug")
                 # Step 3: 正常完了時のみ atomic に1ターン記録
                 # cancel 時はここに到達しないため user/ai どちらも記録されない
-                await self.conversation_cache.add_turn(input_text, ai_response)
+                # Fix-6 P1-c (4) conversation_cache 汚染防止: 内部 nudge は履歴に書かない
+                if not is_internal_nudge:
+                    await self.conversation_cache.add_turn(input_text, ai_response)
+                else:
+                    # 内部 nudge ターンの応答は別 logger に記録 (recent_context 汚染防止)
+                    import logging as _logging
+                    _task_log = _logging.getLogger("eve.task")
+                    _task_log.info("[Nudge-Response] %s -> %s", input_text[:40], ai_response[:60])
                 # Phase 4.3.1: 生ターン保存は撤去。
                 # RAG 入力は feedback ループが Episode Summary 経由で行う (rag.add_episode)。
                 # conversation_history.txt は別途 cache 経由で監査用に蓄積される。
@@ -322,6 +445,58 @@ class BaseMode(ABC):
             # フィードバックループに「ターン完了」シグナルを送る (Event.set のみ、同期・即時)
             if self.feedback:
                 self.feedback.signal_turn_done()
+
+            # Step 1.5: active_instruction の状態遷移を確定（PENDING→ACTIVE/EXPIRED 等）。
+            # 例外で応答パスを止めないよう必ず try/except で wrap する。
+            # 次応答の system prompt 構築時に正しく ACTIVE/EXPIRED が反映される。
+            if self.task_manager is not None:
+                try:
+                    await self.task_manager._reconcile_instruction_status()
+                except Exception as e:
+                    self.log("System", f"[Task] reconcile failed: {e}", level="debug")
+
+                # Step 1.5 Fix Layer E E0+E2: clear_active_instruction(done) が
+                # command_queue にあれば drain させ、 PROVISIONAL_DONE 化を確定させる。
+                # その後 pop_pending_audits で未 audit の instructions を取り出し、
+                # AI2 audit を fire-and-forget で spawn する（応答 latency に影響しない）。
+                # Fix-6 P2-g: audit prompt に直近会話 + VLM ナレーションを渡して精度向上
+                if self.feedback is not None:
+                    try:
+                        await self.task_manager.flush_command_queue(timeout=2.0)
+                        pending = self.task_manager.pop_pending_audits()
+                        if pending:
+                            # Fix-6 P2-g: audit に渡す文脈情報を 1 回だけ取得
+                            audit_recent_turns = None
+                            audit_vlm_narration = None
+                            try:
+                                audit_recent_turns = await self.conversation_cache.get_recent_turns(
+                                    count=5, exclude_ellipsis=True,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                if self.vlm_bridge and self.vlm_bridge.is_running:
+                                    audit_vlm_narration = self.vlm_bridge.get_scene_description() or None
+                            except Exception:
+                                pass
+                            for inst_meta in pending:
+                                asyncio.create_task(
+                                    self.feedback.audit_provisional_instruction(
+                                        instruction_id=inst_meta["id"],
+                                        instruction_text=inst_meta["instruction"],
+                                        eve_response=inst_meta["eve_response"],
+                                        task_manager=self.task_manager,
+                                        recent_turns=audit_recent_turns,
+                                        vlm_narration=audit_vlm_narration,
+                                    )
+                                )
+                            self.log(
+                                "System",
+                                f"[Audit] spawned {len(pending)} provisional audits (with context)",
+                                level="debug",
+                            )
+                    except Exception as e:
+                        self.log("System", f"[Audit] spawn failed: {e}", level="debug")
 
             total_time = time.time() - start_time
             self.log("System", f"Response time: {total_time*1000:.1f}ms", level="debug")
@@ -347,6 +522,10 @@ class BaseMode(ABC):
 
             # history を完全 restore (user/assistant/tool すべて削除)
             self.llm.history = self.llm.history[:history_len_before]
+            # Step 1.5 Fix A2-5: cancel 経路でも pending_clear をリセット
+            # （次応答に stale な clear が持ち越されて誤 flush するのを防ぐ）
+            if hasattr(self.llm, "_pending_clear_instructions"):
+                self.llm._pending_clear_instructions = []
             self.log("System", "[Cancelled] LLM stream aborted, history rolled back", level="debug")
             # 部分応答は記録しない（add_ai_response 未呼び出しなので OK）
             raise

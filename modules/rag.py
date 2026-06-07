@@ -4,15 +4,30 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from collections import deque
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 import numpy as np
 from openai import AsyncOpenAI
 from config import Config
 
+if TYPE_CHECKING:
+    from modules.task_manager import TaskManager
+
 logger = logging.getLogger(__name__)
+
+# Fix-4 Phase 1 C1-b: feedback.CAPABILITY_DENIAL_PATTERN と完全同期。
+# 検索時に既存 entry にも動的 tag 付与するため、 同じパターンをここでも保持する。
+CAPABILITY_DENIAL_PATTERN = re.compile(
+    r"(時間|ターン|秒)(認識|計測|追跡|数え)?(.{0,30})?(限界|測れな|計測できな|追跡できな|数えられな|ズレ|失敗|認識.{0,5}な)"
+    r"|(能力|機能).{0,20}(限界|外|不全|諦め)"
+    r"|履行(失敗|できな|不能|不可)"
+    r"|(無理|苦手|諦め|わからな|調べられな|honestly|能力外).{0,30}(認め|伝え|認識|honest)"
+    r"|hallucinat"
+    r"|時間感覚がな"
+)
 
 
 def _strip_embedding(entry: dict) -> dict:
@@ -33,6 +48,13 @@ class RAGHandler:
         self._write_queue = asyncio.Queue()
         self._write_task = None
         self._lock = asyncio.Lock()
+        # Fix-4 Phase 1 C2: TaskManager 参照 (active instruction 判定用)。
+        # base_mode.initialize で `rag.set_task_manager(task_manager)` で注入される。
+        self._task_manager: Optional["TaskManager"] = None
+
+    def set_task_manager(self, tm) -> None:
+        """Fix-4 Phase 1: TaskManager を後付け注入。active 時の penalty 判定で使う。"""
+        self._task_manager = tm
         
     async def initialize(self):
         """初期化：既存のRAGファイルからメモリをロード"""
@@ -305,6 +327,43 @@ class RAGHandler:
                 "relevance": relevance,
                 "entry": entry,
             })
+        # ── Fix-4 Phase 1 C1-b: 検索時の動的 capability_denial tag 付与 ─────────
+        # 既存ファイル (rag_memory.jsonl の 21 件) は永続化された tag なしだが、
+        # ここで summary に regex 適用して in-memory に動的タグを追加する。
+        # ファイルは不変。 過剰マッチを防ぐため self-attribution 暗黙性に注意。
+        tagged_inmemory = 0
+        for cand in candidates:
+            entry = cand["entry"]
+            summary = entry.get("summary", "")
+            if not summary:
+                continue
+            if CAPABILITY_DENIAL_PATTERN.search(summary):
+                tags = entry.get("topic_tags", []) or []
+                if "capability_denial" not in tags:
+                    entry["topic_tags"] = tags + ["capability_denial"]
+                    tagged_inmemory += 1
+
+        # ── Fix-4 Phase 1 C2: active 時に capability_denial entry に penalty ────
+        # base_score × 0.3 で抑制（完全除外しない、 学習材料として残す）。
+        # active なし時は penalty 無しで既存挙動完全維持。
+        is_active = (
+            self._task_manager is not None
+            and self._task_manager.has_active_instruction()
+        )
+        if is_active:
+            penalized = 0
+            for cand in candidates:
+                tags = cand["entry"].get("topic_tags", []) or []
+                if "capability_denial" in tags:
+                    cand["base_score"] *= 0.3
+                    penalized += 1
+            if penalized:
+                logger.debug(
+                    "[RAG] capability_denial penalty applied: %d entries "
+                    "(active instruction, dynamic_tagged=%d)",
+                    penalized, tagged_inmemory,
+                )
+
         candidates.sort(key=lambda x: -x["base_score"])
         candidates = candidates[:max(top_k * 4, 20)]  # 候補プール
 

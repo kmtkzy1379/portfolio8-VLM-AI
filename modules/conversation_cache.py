@@ -188,13 +188,24 @@ class ConversationCache:
             exclude_ellipsis: True なら user 発話が「…」だけのターンを除外する。
                 沈黙時に AI 自身が出した内部見守り発話で recent_conversation が
                 埋まり、直前の実会話が押し出される問題への対策。
+
+        戻り値の各 dict は user/ai/user_timestamp/ai_timestamp を含む
+        （Step 1.5 で timestamp を含めるよう拡張、既存呼び出しは user/ai のみ参照で互換）。
         """
         async with self._lock:
             all_turns = list(self.turns)
             if exclude_ellipsis:
                 all_turns = [t for t in all_turns if t.get("user", "").strip() != "…"]
             recent = all_turns[-count:] if len(all_turns) > count else all_turns
-            return [{"user": turn["user"], "ai": turn["ai"]} for turn in recent]
+            return [
+                {
+                    "user": turn["user"],
+                    "ai": turn["ai"],
+                    "user_timestamp": turn.get("user_timestamp", ""),
+                    "ai_timestamp": turn.get("ai_timestamp", ""),
+                }
+                for turn in recent
+            ]
 
     async def get_silence_summary(self) -> Dict[str, Optional[float]]:
         """直前期間の沈黙状態を計算する。

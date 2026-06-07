@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from collections import deque
+from datetime import datetime
 from typing import Optional
 from groq import AsyncGroq
 from openai import AsyncOpenAI
@@ -82,6 +83,114 @@ VISION_TOOLS = [
                     }
                 },
                 "required": ["enabled"]
+            }
+        }
+    }
+]
+
+
+# Step 1.5 Fix A2-3: 無意味相槌セット（完全一致で「履行発話と認めない」判定）。
+# DISMISSIBLE_UTTERANCES 完全一致のときのみ clear_active_instruction(done) を defer→drop する。
+# 「やあ」「30秒だよ」「了解」「了解！」「呼んだ」など、 ここに含まれない短い実発話は許容する。
+# プロンプト (`prompts/talk_prompt.py`) の文言と必ず同期させる。
+DISMISSIBLE_UTTERANCES = frozenset({
+    "",
+    "…", "...", "...", "　",
+    "うん", "うん。", "うんっ", "うん！",
+    "あ", "あ。", "あ！",
+    "ん", "ん。", "ん！",
+    "はい", "はい。",
+    "あー", "あーね", "あーと",
+    "んー", "んーと",
+})
+
+
+# Step 1.5: Meta tools（VLM 未起動でも使える、active_instruction 管理）
+# Step 4-5 で request_validation / update_task_status が追加される（プラン参照）。
+META_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_active_instruction",
+            "description": (
+                "短期予約・約束・期限付きアクションを登録する。【限定用途】: "
+                "ユーザーが明示的に約束を求めた瞬間、自分が「○○までに必ず X する」と決めた瞬間、"
+                "ユーザーが「これだけは忘れずに」と言った瞬間にのみ呼ぶ。"
+                "【deadline は絶対時刻 (ISO 8601) のみ受け付ける】。"
+                "ユーザーが「2 ターン後」「3 ターンしてから」のようなターン数指定をしてきた場合、"
+                "自分は会話ターンを正確に数えられる保証は無いので、"
+                "(i) 直近の会話ペース (recent_context の各ターンに付いている timestamp の間隔) から "
+                "時間に変換して deadline_at を計算する、または "
+                "(ii) 確信が無ければユーザーに「何秒後がいいですか？」と確認してから登録すること。"
+                "【雑談中の思いつき、AI2 の参考意見、現在方針 (goal_short) の更新には使わない】。"
+                "コロコロ呼ぶと expired で消えていくので、本当に「忘れたくないこと」だけに絞る。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "予約内容 (8〜40 字、固有名詞・行動を含める)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "なぜ予約するか（1 文）"
+                    },
+                    "deadline_at": {
+                        "type": "string",
+                        "description": (
+                            "（任意、ただし強く推奨）ISO 8601 形式の絶対時刻のみ"
+                            "（例: '2026-05-17T13:01:30'、tz naive）。"
+                            "相対時間（『30秒後』『+30s』『2 ターン後』等）は禁止。"
+                            "ユーザー指定が相対の場合は、自分で現在時刻に加算して絶対時刻に変換すること。"
+                            "未指定の場合は 5 分後に自動 expire する。"
+                        )
+                    }
+                },
+                "required": ["instruction", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_active_instruction",
+            "description": (
+                "登録した active_instruction を明示的にクリアする。 "
+                "履行完了 (status=done) / ユーザーが取消し・矛盾する新指示を出した (status=superseded) "
+                "ときに呼ぶ。 "
+                "【重要】 status=done のときは **履行発話を出した後でのみ呼ぶ**。 "
+                "空発話・「…」「うん」「あ」「はい」等の無意味相槌のみで done を呼ぶことは "
+                "**アプリ側で却下** され、 instruction は ACTIVE のまま残る（履行と認められない）。 "
+                "約束を **言葉で表現してから** 必ずクリアすること。 "
+                "ユーザー取消し (status=superseded) は発話無しでも即時クリアされる。 "
+                "【Fix-3.5】 status=superseded は **ユーザーが明示的取消し発話** "
+                "（「やっぱやめて」「キャンセル」「もういい」「それなしで」「あの予約取消し」 "
+                "「やめにする」「忘れて」「やらなくていい」など）を出した瞬間のみ呼ぶ。 "
+                "**沈黙 (… のみ)・相槌（うん / へえ / そう）・ユーザー反応無しでの superseded 呼び出しは禁止**。 "
+                "推測ベース (沈黙が長いから諦めた / 反応がないから取消し等) で superseded を呼ぶことは "
+                "アプリ側でも guard により蹴られる。 "
+                "また、 既に終端状態 (DONE / EXPIRED / SUPERSEDED) や PROVISIONAL_DONE の "
+                "instruction への二重 clear もアプリ側で蹴られる。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "クリア対象の instruction id (プロンプトに表示されている `i_xxxxx`)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["done", "superseded"],
+                        "description": "履行完了なら done、取消し・矛盾なら superseded"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "クリア理由 (1 文)"
+                    }
+                },
+                "required": ["id", "status"]
             }
         }
     }
@@ -286,10 +395,19 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         self.history = [{"role": "system", "content": self.system_prompt}]
         self.ai2_feedback = ""  # AI2フィードバックを専用変数で保持
+        # Step 1.5: AI2 ノートが最後に更新された時刻（ISO timestamp）。
+        # 「過去の体験として記録」の経過時間表示に使う。base_mode の update_memory_func で更新。
+        self._ai2_feedback_set_at: Optional[str] = None
         self.vlm_context = ""  # VLM画面認識コンテキスト
         # 沈黙サマリ (ConversationCache.get_silence_summary の戻り値)。
         # recent_turns から「…」を除外したため、その情報を別経路で AI1 に渡す。
         self.silence_summary: Optional[dict] = None
+        # A1: この沈黙ストリーク中に自分が既に言った nudge 発話の控え（TalkMode が毎 nudge 代入）。
+        # 各要素 {"category": str, "text": str}。会話履歴/RAG には残さない ephemeral 表示専用。
+        self.nudge_self_memory: list = []
+        # Fix-9b: 一貫性ストア — 既にコミットした自分の答え/嗜好（base_mode が process_input で代入）。
+        # 各要素 {"topic": str, "answer": str}。会話履歴/RAG には残さない ephemeral 表示専用。
+        self.committed_facts: list = []
         # Step 2: 一回限りの追加コンテキスト（中断マーカー等）。
         # _build_system_prompt で展開後に空文字でクリアされる。
         # vlm_context は process_input 内で毎ターン上書きされるため、別枠が必要。
@@ -304,6 +422,17 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # Phase 3: Vision components
         self._vlm_bridge = None
         self._vision_tools_enabled = False
+
+        # Step 1.5: Meta tools (active_instruction 管理)
+        self._task_manager = None
+        self._meta_tools_enabled: bool = False
+        # Step 1.5: AI2 提案履歴を取得する callable（feedback.get_goal_history_for_prompt 想定）
+        # base_mode.initialize で feedback 生成後に注入される。
+        self.goal_history_provider = None
+        # Step 1.5 Fix A2: clear_active_instruction(status="done") を defer するためのバッファ。
+        # _tool_augmented_stream の入口でリセット、 streaming 完了後の content 検証で flush or drop。
+        # _cleanup_failed_tool_history と外部 cancel 経路 (base_mode._run_response_pipeline) でもリセット。
+        self._pending_clear_instructions: list[dict] = []
 
         # Phase 4.3.3 (Batch 2): Goal Slot 二層 — in-memory が SoT、goal.txt は永続化補助
         self.goal_file = Config.GOAL_FILE
@@ -350,6 +479,16 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         self._vision_tools_enabled = vlm_bridge is not None
         logger.info("Vision tools %s for LLM", "enabled" if self._vision_tools_enabled else "disabled")
 
+    def set_task_manager(self, task_manager) -> None:
+        """Step 1.5: TaskManager を後付け注入する（active_instruction ツール用）。"""
+        self._task_manager = task_manager
+
+    def enable_meta_tools(self, flag: bool) -> None:
+        """Step 1.5: META_TOOLS（set/clear_active_instruction）の AI1 への露出を切り替え。
+        TalkMode のみ True にする（base_mode 経由）。"""
+        self._meta_tools_enabled = bool(flag)
+        logger.info("Meta tools %s for LLM", "enabled" if self._meta_tools_enabled else "disabled")
+
     def append_vlm_alert(self, vision_frame) -> None:
         """VLM alert を _vlm_alerts に蓄積（メインループ内から呼ぶ）。
 
@@ -380,6 +519,31 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             return f"{int(seconds // 60)}分前"
         return f"{int(seconds // 3600)}時間前"
 
+    @staticmethod
+    def _format_turn_timestamp(iso_ts: str, now_dt: datetime, show_relative: bool) -> str:
+        """Step 1.5: recent_turns のターン timestamp を `[HH:MM:SS / N秒前]` か `[HH:MM:SS]` に整形。
+
+        iso_ts が空 / parse 失敗時は空文字を返す（呼び出し側で安全に省略表示）。
+        show_relative=False なら絶対時刻のみ（古いターンの字数節約）。
+        """
+        if not iso_ts:
+            return ""
+        try:
+            ts_dt = datetime.fromisoformat(iso_ts)
+        except (ValueError, TypeError):
+            return ""
+        hhmmss = ts_dt.strftime("%H:%M:%S")
+        if not show_relative:
+            return f"[{hhmmss}]"
+        age = max(0.0, (now_dt - ts_dt).total_seconds())
+        if age < 1:
+            return f"[{hhmmss} / たった今]"
+        if age < 60:
+            return f"[{hhmmss} / {int(age)}秒前]"
+        if age < 3600:
+            return f"[{hhmmss} / {int(age // 60)}分前]"
+        return f"[{hhmmss} / {int(age // 3600)}時間前]"
+
     def _format_alert(self, alert: tuple) -> str:
         """alert (ts, narration, tag) を「[たった今/MAJOR] narration」形式に整形"""
         ts, narration, tag = alert
@@ -390,15 +554,49 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
     def _build_system_prompt(self, user_text: str) -> str:
         """システムプロンプトを動的再構築"""
+        # Step 1.5: 現在時刻（タイムスタンプ計算の起点）
+        now_dt = datetime.now()
+
         # AI2フィードバックコンテキスト
-        # AI2 (FeedbackHandler) が抽出した「応答AIへの内省ノート」だけがここに来る。
-        # FEP 用語を含む長文ではなく、自然な日本語で書かれた行動指針。
+        # Step 1.5: AI2 ノートは「過去の体験として記録」フォーマットで表示し、AI1 が
+        # 古い参考情報として認識できるようにする（指摘 4 への対応）。
         ai2_context = ""
         if self.ai2_feedback:
+            ts_label = ""
+            if self._ai2_feedback_set_at:
+                try:
+                    set_dt = datetime.fromisoformat(self._ai2_feedback_set_at)
+                    age_sec = (now_dt - set_dt).total_seconds()
+                    ts_label = (
+                        f"（作成 {set_dt.strftime('%H:%M:%S')} / "
+                        f"{self._format_alert_age(max(0.0, age_sec))} — "
+                        "現在は状況が変わっている可能性、必要なら今の判断で上書き）"
+                    )
+                except (ValueError, TypeError):
+                    pass
+            if not ts_label:
+                ts_label = "（過去の参考情報 — 現在は状況が変わっている可能性、必要なら今の判断で上書き）"
             ai2_context = (
-                "\n[直前期間の内省ノート — AI1 行動指針]:\n"
+                f"\n[過去の体験として記録された内省ノート {ts_label}]:\n"
                 f"{self.ai2_feedback}\n"
             )
+
+        # Step 1.5: 過去の goal 提案履歴（AI2 内省、参考記録）
+        # feedback._goal_history を AI1 に提示し、「過去にこう考えていたが今は違う」と認識させる
+        goal_history_context = ""
+        if self.goal_history_provider is not None:
+            try:
+                goal_history_context = self.goal_history_provider(max_items=5)
+            except TypeError:
+                # max_items kwarg を受け付けないコールバックなら引数なしで再試行
+                try:
+                    goal_history_context = self.goal_history_provider()
+                except Exception as e:
+                    logger.warning("[LLM] goal_history_provider failed: %s", e)
+                    goal_history_context = ""
+            except Exception as e:
+                logger.warning("[LLM] goal_history_provider failed: %s", e)
+                goal_history_context = ""
 
         # RAG記憶コンテキスト (Phase 4.3.1: type 別分岐対応)
         rag_context = ""
@@ -440,14 +638,59 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                     "沈黙が長いほど確認質問の選択肢を意識せよ。\n\n"
                 )
 
+        # A1: この沈黙中に自分が既に言ったこと（nudge 自己記憶）。同じ話題・言い回しの反復を防ぐ。
+        # TalkMode が沈黙 nudge のたびに self.nudge_self_memory を代入。会話履歴には残らない。
+        nudge_memory_context = ""
+        _mem = getattr(self, "nudge_self_memory", None)
+        if _mem:
+            _mem_lines = "\n".join(
+                f"  - [{m.get('category', '?')}] {m.get('text', '')}" for m in _mem[-6:]
+            )
+            nudge_memory_context = (
+                "[この沈黙中に自分が既に言ったこと（繰り返さない）]:\n"
+                f"{_mem_lines}\n"
+                "  ※ 同じ話題・同じ言い回しを再提示しない。確認質問は1ストリークに1回まで"
+                "（[check] が既にあれば出さない）。沈黙が深いほど「…」を選ぶ。\n\n"
+            )
+
+        # Fix-9b: 一貫性ストア — 既にコミットした自分の答え/嗜好。理由なくぶれさせない（firm/ペルソナ持続）。
+        # base_mode が process_input で self.committed_facts を代入（idle / 督促 / 通常の全経路カバー）。
+        committed_facts_context = ""
+        _cf = getattr(self, "committed_facts", None)
+        if _cf:
+            _cf_lines = "\n".join(
+                f"  - 〈{c.get('topic', '?')} = {c.get('answer', '')}〉" for c in _cf[-6:]
+            )
+            committed_facts_context = (
+                "[一貫性: 中身(substance)は firm、表現(expression)は毎回多様に]:\n"
+                f"{_cf_lines}\n"
+                "  【中身は守る】前に答えた内容を別の答えにすり替えない（猫と言ったのに後でうさぎ、は禁止）。"
+                "沈黙中や期限超過の催促でも同じ。変えてよいのは自分が体験・強い理由で考えを改めたとき、"
+                "またはユーザーが明確な理由を示したときだけ。尋ね直された／沈黙が続いただけでは変えない。\n"
+                "  【表現は毎回変える】同じ答えでも、言い回し・感情・詳細度・切り口を毎ターン意識して変える。"
+                "同じ言い方を繰り返さない。たとえば「猫」でも: 「猫だよ、強い」/「…猫。やっぱり猫」/"
+                "「猫かな。あの気まぐれが好き」/「猫ですね、なんか惹かれる」のように毎回ちがう顔で。\n\n"
+            )
+
         # 直近5ターン (「…」は除外済み、生は base_mode 側でフィルタ)
+        # Step 1.5: 各ターンに timestamp を表示し、AI1 がターン間隔から時間感覚を持てるようにする。
+        # 直近 3 ターンのみ相対時間 (N秒前) を付ける（古いものは絶対時刻のみで字数節約）。
         recent_context = ""
         if hasattr(self, "recent_turns") and self.recent_turns:
-            recent_context = "[Recent Conversation (直前の実会話)]:\n"
+            recent_context = "[Recent Conversation (直前の実会話、各行に時刻付き)]:\n"
+            n_total = len(self.recent_turns)
             for i, turn in enumerate(self.recent_turns, 1):
-                recent_context += f"{i}. User: {turn.get('user', '')}\n"
+                # 直近 3 ターン（i が n_total-2 以上）には相対時間付き
+                show_relative = (i > n_total - 3)
+                u_ts = turn.get("user_timestamp", "")
+                a_ts = turn.get("ai_timestamp", "")
+                u_label = self._format_turn_timestamp(u_ts, now_dt, show_relative)
+                a_label = self._format_turn_timestamp(a_ts, now_dt, show_relative)
+                user_prefix = f"{u_label} " if u_label else ""
+                ai_prefix = f"{a_label} " if a_label else ""
+                recent_context += f"{i}. {user_prefix}User: {turn.get('user', '')}\n"
                 if turn.get('ai'):
-                    recent_context += f"   AI: {turn.get('ai', '')}\n"
+                    recent_context += f"   {ai_prefix}AI: {turn.get('ai', '')}\n"
             recent_context += "\n"
 
         # VLM画面認識コンテキスト
@@ -486,13 +729,30 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         # Phase 4.3.3 (Batch 2): Goal Slot を「# Start Conversation」直前に注入
         # Lost in the Middle (Liu et al. 2023) 対応で末尾近くに配置 → attention が強い位置
+        # Step 1.5: 設定時刻 + 経過時間を表示し、AI1 が「古い方針か」を判断できるようにする
         goal_block = ""
         if self.current_goal_slot:
             gs = self.current_goal_slot.get("goal_short", "")
             gl = self.current_goal_slot.get("goal_long", "")
+            extracted_at = self.current_goal_slot.get("extracted_at", "")
+            ts_suffix = ""
+            if extracted_at:
+                try:
+                    ext_dt = datetime.fromisoformat(extracted_at)
+                    age = max(0.0, (now_dt - ext_dt).total_seconds())
+                    ts_suffix = (
+                        f"（設定 {ext_dt.strftime('%H:%M:%S')} / "
+                        f"{self._format_alert_age(age)} by AI2-feedback）"
+                    )
+                except (ValueError, TypeError):
+                    pass
             if gs:
+                header = "[現在の目的 — 行動の最優先指針"
+                if ts_suffix:
+                    header += " " + ts_suffix
+                header += "]:"
                 goal_block = (
-                    "\n[現在の目的 — 行動の最優先指針]:\n"
+                    f"\n{header}\n"
                     f"  {gs}\n"
                 )
                 if gl:
@@ -517,15 +777,41 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             one_shot_block = f"\n[一時情報]: {self.one_shot_context}\n"
             self.one_shot_context = ""  # 一回限り消費
 
+        # Step 1.5: 現在時刻セクション（最末尾、AI1 が deadline 計算の起点として使う）
+        # 「Turn N」表示はしない（ユーザー方針: turn 番号認識を採用しない）。
+        # Fix-B1: 日付を必ず与える。時刻のみだと LLM が deadline_at の日付を誤り、
+        # 前日 deadline（登録直後 ACTIVE）を生成してしまうため（tasks.jsonl で観測）。
+        _wd = ["月", "火", "水", "木", "金", "土", "日"][now_dt.weekday()]
+        now_block = (
+            f"\n[現在時刻]: {now_dt.strftime('%Y-%m-%d')}（{_wd}）{now_dt.strftime('%H:%M:%S')}\n"
+            f"  ※ deadline_at は必ずこの日付を基準に。今は {now_dt.strftime('%Y-%m-%dT%H:%M:%S')}。"
+            "「30秒後」ならこれに 30 秒足した ISO 文字列にすること。\n"
+        )
+
+        # Step 1.5: active_instruction の注入
+        # PENDING / EXPIRING → goal_block の前（穏やか表示）
+        # ACTIVE → goal_block の後（最強位置で「期限超過」を強調表示）
+        instruction_pending_block, instruction_active_block = self._build_instruction_blocks(now_dt)
+        # Fix-8 (code gate): 内部 nudge では PENDING ブロックを抑制し、早期履行を防ぐ。ACTIVE は残す。
+        if getattr(self, "_suppress_pending_block", False):
+            instruction_pending_block = ""
+
         # 組み立て
         base_content = self.system_prompt
         if "# Start Conversation" in base_content:
             base_content = base_content.split("# Start Conversation")[0].rstrip()
 
+        # Step 1.5 Fix B1: instruction_active_block を prompt 最末尾に移動。
+        # Lost in the Middle (Liu et al. 2023) で「最末尾 = 最も attention が強い位置」を活用。
+        # 現在時刻は instruction_active_block 内部に再掲しているため、ここでは now_block を前に置く。
         combined = (
-            ai2_context + vlm_context_str + vlm_alerts_block + vision_hint
-            + rag_context + silence_context + recent_context + goal_block
-            + one_shot_block
+            ai2_context + goal_history_context
+            + vlm_context_str + vlm_alerts_block + vision_hint
+            + rag_context + silence_context + nudge_memory_context + committed_facts_context + recent_context
+            + instruction_pending_block
+            + goal_block
+            + one_shot_block + now_block
+            + instruction_active_block  # ← 最末尾、`# Start Conversation` 直前
         )
 
         # Inject ログ: 何が AI1 に注入されたかを Show debug 時に UI に流す。
@@ -554,8 +840,152 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             "私の発言に対して、最も人間らしく、最もイブらしい反応を返してください。"
         )
 
+    def _build_instruction_blocks(self, now_dt: datetime) -> tuple[str, str]:
+        """Step 1.5: active_instruction の system prompt 注入ブロックを生成。
+
+        Returns:
+            (pending_block, active_block)
+              pending_block: PENDING / EXPIRING を集約。goal_block 直前に挿入される穏やか表示。
+              active_block:  ACTIVE のみを集約。goal_block 直後に挿入される最末尾強調表示。
+
+        TaskManager 未接続 / 該当 instruction 無し なら両方とも空文字を返す。
+        """
+        if self._task_manager is None:
+            return ("", "")
+        try:
+            insts = self._task_manager.get_active_instructions_for_prompt()
+        except Exception as e:
+            logger.warning("[LLM] get_active_instructions_for_prompt failed: %s", e)
+            return ("", "")
+        if not insts:
+            return ("", "")
+
+        pending_lines: list[str] = []
+        expiring_lines: list[str] = []
+        active_lines: list[str] = []
+        for it in insts:
+            derived = it.get("derived_status", "pending")
+            iid = it.get("id", "")
+            text = it.get("instruction", "")
+            reason = it.get("reason", "")
+            created_at = it.get("created_at", "")
+            deadline_at = it.get("deadline_at")
+
+            if derived == "active":
+                overdue = it.get("seconds_overdue", 0)
+                dl_label = ""
+                if deadline_at:
+                    try:
+                        dl_dt = datetime.fromisoformat(deadline_at)
+                        dl_label = dl_dt.strftime("%H:%M:%S")
+                    except (ValueError, TypeError):
+                        pass
+                created_label = ""
+                if created_at:
+                    try:
+                        c_dt = datetime.fromisoformat(created_at)
+                        c_age = max(0.0, (now_dt - c_dt).total_seconds())
+                        created_label = f"{c_dt.strftime('%H:%M:%S')} ({self._format_alert_age(c_age)})"
+                    except (ValueError, TypeError):
+                        pass
+                active_lines.append(
+                    f"  {iid}\n"
+                    f"  内容: {text}\n"
+                    f"  根拠: {reason}{(' / 登録 ' + created_label) if created_label else ''}\n"
+                    f"  deadline: {dl_label} ({overdue} 秒経過)\n"
+                    f"  履行例（参考、 一語一句同じである必要はない、 状況に応じて自然な表現で OK）:\n"
+                    f"    「来たよ、 {text}」 / 「今だよね」 / 「{text} って言ったよね、 今!」など。\n"
+                    f"    ※ 例文をそのまま流用せず、 その時の会話と感情に合った言葉を選ぶ。\n"
+                    f"  ★ まず実発話する → そのあと clear_active_instruction(id=\"{iid}\", status=\"done\") を呼ぶ。\n"
+                    f"  ★ 発話無しで done だけ呼ぶことは アプリが拒否する（instruction が ACTIVE のまま残る）。\n"
+                    f"  ★ ユーザーが既に取消した場合は status=\"superseded\" でクリア（発話不要）。"
+                )
+            elif derived == "expiring":
+                remain = it.get("seconds_until_default_expire", 0)
+                expiring_lines.append(
+                    f"  {iid} 「{text}」 — 自動消去まで残り {max(0, int(remain))} 秒"
+                )
+            else:  # pending
+                if deadline_at:
+                    try:
+                        dl_dt = datetime.fromisoformat(deadline_at)
+                        seconds_left = int(max(0, (dl_dt - now_dt).total_seconds()))
+                        pending_lines.append(
+                            f"  {iid} 「{text}」 — 期限 {dl_dt.strftime('%H:%M:%S')} / あと {seconds_left} 秒"
+                        )
+                    except (ValueError, TypeError):
+                        pending_lines.append(f"  {iid} 「{text}」 — 期限未設定")
+                else:
+                    pending_lines.append(f"  {iid} 「{text}」 — 期限未設定（5 分で自動消去）")
+
+        pending_block = ""
+        if pending_lines or expiring_lines:
+            sections = []
+            if pending_lines:
+                sections.append("[短期予約 — まだ期限前]:\n" + "\n".join(pending_lines))
+            if expiring_lines:
+                sections.append(
+                    "[短期予約 — !! 自動消去が近い、今やるか取消すか決めて !!]:\n"
+                    + "\n".join(expiring_lines)
+                )
+            pending_block = "\n" + "\n\n".join(sections) + "\n"
+
+        active_block = ""
+        if active_lines:
+            # Step 1.5 Fix B1: prompt 最末尾に置かれるため、 block 先頭で現在時刻を再掲
+            # （now_block を前に置いた場合の参照ズレを補正、 Lost in the Middle 対応）
+            active_block = (
+                f"\n[現在時刻: {now_dt.strftime('%Y-%m-%d %H:%M:%S')} / 約束の時刻に到達している]\n"
+                "[**!! 期限超過 — 必ず今すぐ履行または取消し !!**]\n"
+                + "\n\n".join(active_lines)
+                + "\n"
+            )
+
+        return (pending_block, active_block)
+
     def _execute_tool(self, tool_name: str, arguments: dict) -> str:
-        """tool_callを実行して結果テキストを返す（同期）"""
+        """tool_callを実行して結果テキストを返す（同期）。
+
+        Step 1.5 から META_TOOLS（set_active_instruction / clear_active_instruction）を
+        最上段で処理する。これらは VLM 未起動でも使える。
+        """
+        # ----- META_TOOLS (VLM 未起動でも使える) -----
+        if tool_name == "set_active_instruction":
+            if self._task_manager is None:
+                return "（TaskManager 未接続）"
+            self._task_manager.enqueue_command_nowait({
+                "kind": "set_active_instruction",
+                "instruction": (arguments.get("instruction") or "").strip(),
+                "reason": arguments.get("reason", ""),
+                "deadline_at": arguments.get("deadline_at"),
+                "created_by": "ai1",
+            })
+            return "予約を登録しました"
+
+        if tool_name == "clear_active_instruction":
+            if self._task_manager is None:
+                return "（TaskManager 未接続）"
+            status_str = arguments.get("status", "done")
+            cmd = {
+                "kind": "clear_active_instruction",
+                "id": arguments.get("id", ""),
+                "status": status_str,
+                "reason": arguments.get("reason", ""),
+            }
+            # Step 1.5 Fix A2-2: status=superseded は発話不要で即時クリア（gate 対象外）
+            if status_str == "superseded":
+                self._task_manager.enqueue_command_nowait(cmd)
+                return "予約を取消しました"
+            # Step 1.5 Fix A2-3: status=done は defer。 streaming 完了後に content 検証を経て
+            # 通過なら flush、 失敗なら drop + notify_clear_rejected で再 nudge を要請する。
+            self._pending_clear_instructions.append(cmd)
+            return (
+                "クリア予約しました。 実発話を出した直後に確定します"
+                "（発話無し / 無意味相槌のみの場合、 本予約は自動的に無効化され "
+                "instruction は ACTIVE のままになります）"
+            )
+
+        # ----- VISION_TOOLS (VLM 必須) -----
         if not self._vlm_bridge:
             return "エラー: VLMが未起動です"
 
@@ -649,31 +1079,54 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         self.history = [system] + rest[start:]
 
-    async def generate_stream(self, user_text: str):
+    async def generate_stream(self, user_text: str, is_internal_nudge: bool = False):
         """2段階generate_stream:
         Phase 1: 非ストリーミングでtool_call判定
         Phase 2: tool結果を含めてストリーミング応答
+
+        Fix-6 P1-d: is_internal_nudge=True なら history 汚染防止。
+        ターン入口で snapshot を取り、 finally で全 append を rollback する
+        (user/assistant/tool 全部を消去、 次ターン以降の context に内部 nudge が残らない)。
+        内部 nudge 内容は system prompt の one_shot_context として 1 ターン限り注入。
         """
+        # Fix-6 P1-d 順序修正: one_shot_context を先にセットしてから system prompt 構築
+        if is_internal_nudge:
+            self.one_shot_context = f"[内部通知]: {user_text}"
+        # Fix-8 (code gate): 内部 nudge（沈黙/督促）では PENDING 予約ブロックを隠す。
+        # 沈黙中に PENDING を見せると期限前に先回り履行してしまう（Tier-2 で prompt のみでは 0/5）。
+        # ACTIVE（[期限超過]）ブロックは隠さないので、期限到来後の履行は通常どおり行われる。
+        self._suppress_pending_block = is_internal_nudge
+
         # システムプロンプト動的再構築
         if self.history[0]["role"] == "system":
             self.history[0]["content"] = self._build_system_prompt(user_text)
 
-        self.history.append({"role": "user", "content": user_text})
+        # Fix-6 P1-d: 内部 nudge ターン用の history snapshot
+        history_snapshot_len = len(self.history) if is_internal_nudge else None
+
+        if is_internal_nudge:
+            # 内部 nudge は user message を append しない (history 汚染防止)
+            # 代わりに one_shot_context (上でセット済み) が 1 ターン限り system prompt に注入される
+            pass
+        else:
+            self.history.append({"role": "user", "content": user_text})
+
         self._safe_trim_history()
 
         try:
             # Phase 3: tool_call対応の2段階生成
-            # VLM bridge が接続+running なら tool を有効化する。
-            # buffer 空でも get_screen_image は _latest_frame_image 経由で
-            # 取れるため、buffer 件数で gate しない。get_screen_info は内部で
-            # "画面情報なし..." を返すので安全。
-            use_tools = (
+            # VLM bridge が接続+running なら VISION_TOOLS を有効化する。
+            # Step 1.5: META_TOOLS は VLM とは独立に有効化される。
+            use_tools_vlm = (
                 self._vision_tools_enabled
                 and self._vlm_bridge is not None
                 and self._vlm_bridge.is_running
             )
+            use_tools_meta = self._meta_tools_enabled
+            use_tools = use_tools_vlm or use_tools_meta
 
-            print(f"[DEBUG] generate_stream: use_tools={use_tools}, provider={self._provider}, model={self.model}, "
+            print(f"[DEBUG] generate_stream: use_tools={use_tools} (vlm={use_tools_vlm}, meta={use_tools_meta}), "
+                  f"provider={self._provider}, model={self.model}, "
                   f"vision_enabled={self._vision_tools_enabled}, bridge={bool(self._vlm_bridge)}, "
                   f"running={self._vlm_bridge.is_running if self._vlm_bridge else 'N/A'}, "
                   f"buf_len={len(self._vlm_bridge.vision_buffer) if self._vlm_bridge else 'N/A'}")
@@ -682,6 +1135,14 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 try:
                     async for sentence in self._tool_augmented_stream():
                         yield sentence
+                    # Fix-6 P1-d: 内部 nudge ターンの履歴 rollback
+                    if is_internal_nudge and history_snapshot_len is not None:
+                        before_len = len(self.history)
+                        self.history = self.history[:history_snapshot_len]
+                        inject_logger.debug(
+                            "[Nudge] history rollback (len %d -> %d, internal nudge cleanup, tool path)",
+                            before_len, history_snapshot_len,
+                        )
                     return
                 except Exception as e:
                     logger.warning("Tool call failed, falling back: %s", e)
@@ -691,20 +1152,53 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             async for sentence in self._stream_response():
                 yield sentence
 
+            # Fix-6 P1-d: 内部 nudge ターンの履歴 rollback (通常 stream パス)
+            if is_internal_nudge and history_snapshot_len is not None:
+                before_len = len(self.history)
+                self.history = self.history[:history_snapshot_len]
+                inject_logger.debug(
+                    "[Nudge] history rollback (len %d -> %d, internal nudge cleanup, normal path)",
+                    before_len, history_snapshot_len,
+                )
+
         except Exception as e:
             logger.error("LLM Error: %s", e)
             yield "エラーが発生しました。"
+            # Fix-6 P1-d: 例外時も内部 nudge の history を確実に rollback
+            if is_internal_nudge and history_snapshot_len is not None:
+                self.history = self.history[:history_snapshot_len]
 
     async def _tool_augmented_stream(self):
         """tool_call判定 → 必要なら実行 → ストリーミング応答
 
         Tries primary provider first; on failure falls back to Groq.
+        Step 1.5: VISION_TOOLS と META_TOOLS を独立に有効化して合成する。
+        Step 1.5 Fix A2: clear_active_instruction(done) を defer して streaming 完了後に検証する。
         """
+        # Step 1.5 Fix A2-5: 入口で必ず pending_clear をリセット（前回の残骸を捨てる）
+        self._pending_clear_instructions = []
+
+        # Step 1.5: tools 配列を動的合成
+        tools_for_call: list[dict] = []
+        if (
+            self._vision_tools_enabled
+            and self._vlm_bridge is not None
+            and self._vlm_bridge.is_running
+        ):
+            tools_for_call.extend(VISION_TOOLS)
+        if self._meta_tools_enabled:
+            tools_for_call.extend(META_TOOLS)
+        if not tools_for_call:
+            # tool 不要 → 通常 stream にフォールスルー
+            async for s in self._stream_response():
+                yield s
+            return
+
         try:
             first_response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=self.history,
-                tools=VISION_TOOLS,
+                tools=tools_for_call,
                 tool_choice="auto",
                 temperature=0.7,
                 **{self._tokens_param: self._max_tokens},
@@ -714,7 +1208,7 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             first_response = await self._fallback_client.chat.completions.create(
                 model=self._fallback_model,
                 messages=self.history,
-                tools=VISION_TOOLS,
+                tools=tools_for_call,
                 tool_choice="auto",
                 temperature=0.7,
                 max_tokens=self._fallback_max_tokens,
@@ -758,6 +1252,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             # tool結果を含めてストリーミング応答
             async for sentence in self._stream_response():
                 yield sentence
+
+            # Step 1.5 Fix A2-1 + A2-3: streaming 完了後に full_response を取得し、
+            # pending_clear_instructions を content 検証で flush または drop。
+            self._validate_and_flush_pending_clears()
             return
 
         # tool_callなし: contentがあればそれを返す
@@ -765,14 +1263,70 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             self.history.append({"role": "assistant", "content": message.content})
             for sentence in self._split_sentences(message.content):
                 yield sentence
+            # ここは tool_call 無しのパスなので pending_clear は元々空のはずだが、
+            # 念のためリセット（A2-5）
+            self._pending_clear_instructions = []
             return
 
         # contentもtool_callもない: フォールバック
         async for sentence in self._stream_response():
             yield sentence
+        # フォールバックパスでも pending_clear をリセット（A2-5）
+        self._pending_clear_instructions = []
+
+    def _validate_and_flush_pending_clears(self) -> None:
+        """Step 1.5 Fix A2-1 + A2-3: streaming 完了後の content 検証 + flush/drop。
+
+        full_response は _stream_response が `self.history[-1]["content"]` に書き込んでいる
+        前提（同一 async context で race なし）。 DISMISSIBLE_UTTERANCES 完全一致なら
+        TaskManager に notify_clear_rejected を投げて再 nudge を要請、
+        非該当なら pending を全件 flush して通常クリア処理を確定させる。
+        どちらの結末でも最後に pending リストをクリアする（A2-5）。
+        """
+        if not self._pending_clear_instructions:
+            return  # done 系の defer 無し（superseded のみ等）
+
+        # full_response 取得（_stream_response が history 末尾に assistant メッセージを append 済み）
+        full_response = ""
+        if self.history and self.history[-1].get("role") == "assistant":
+            full_response = self.history[-1].get("content", "") or ""
+        stripped = full_response.strip()
+
+        if stripped not in DISMISSIBLE_UTTERANCES:
+            # 検証通過 → 全件 flush（通常の clear 処理として TaskManager に投入）
+            # Step 1.5 Fix Layer E E0: status="done" の cmd には eve_response を同梱して
+            # TaskManager 側で PROVISIONAL_DONE 化 + AI2 audit 待ちに移行できるようにする。
+            if self._task_manager is not None:
+                for cmd in self._pending_clear_instructions:
+                    if cmd.get("status") == "done":
+                        cmd = dict(cmd)  # shallow copy to avoid mutating shared dict
+                        cmd["eve_response"] = full_response
+                    self._task_manager.enqueue_command_nowait(cmd)
+            inject_logger.debug(
+                "[A2] flushed %d pending clears (content ok)",
+                len(self._pending_clear_instructions),
+            )
+        else:
+            # 検証失敗 → drop + 再 nudge 要請
+            if self._task_manager is not None:
+                for cmd in self._pending_clear_instructions:
+                    self._task_manager.enqueue_command_nowait({
+                        "kind": "notify_clear_rejected",
+                        "id": cmd.get("id"),
+                        "reason": (
+                            f"dismissible utterance: {stripped!r}"
+                        ),
+                    })
+            logger.warning(
+                "[A2] rejected %d pending clears (dismissible: %r)",
+                len(self._pending_clear_instructions), stripped,
+            )
+
+        self._pending_clear_instructions = []
 
     def _cleanup_failed_tool_history(self):
-        """tool_call失敗時にhistoryから不完全なtool関連メッセージを除去"""
+        """tool_call失敗時にhistoryから不完全なtool関連メッセージを除去。
+        Step 1.5 Fix A2-5: stale な pending_clear も同時に破棄する。"""
         while len(self.history) > 1:
             last = self.history[-1]
             if last.get("role") == "tool" or (
@@ -781,6 +1335,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 self.history.pop()
             else:
                 break
+        # tool 経路の例外時、 pending_clear が残ると次応答で誤 flush するため必ずリセット
+        self._pending_clear_instructions = []
 
     async def _stream_response(self):
         """ストリーミング応答を文区切りでyield

@@ -5,6 +5,7 @@ import asyncio
 import time
 from typing import Callable, Optional
 
+from config import Config
 from modules import AudioInput, STTHandler
 from prompts import TALK_SYSTEM_PROMPT
 from .base_mode import BaseMode
@@ -15,6 +16,7 @@ class TalkMode(BaseMode):
     
     def __init__(self, log_callback: Optional[Callable[[str, str, str], None]] = None):
         super().__init__(TALK_SYSTEM_PROMPT, log_callback)
+        self.task_planning_enabled = True  # Plan-and-Execute: TalkMode のみ有効
         self.stt: Optional[STTHandler] = None
         self.mic: Optional[AudioInput] = None
         
@@ -29,6 +31,11 @@ class TalkMode(BaseMode):
             # has_unseen_vlm_alerts(consumed_at) で「未対応の新着 alert」を判定。
             "_vlm_alerts_consumed_at": 0.0,
         }
+
+        # A1/A2: 沈黙ストリークの自己管理（ephemeral、実ユーザターンで reset）
+        self._nudge_spoken: list = []          # [{"category","text"}] 沈黙 nudge のみ記録
+        self._nudge_streak_count: int = 0      # 沈黙 "…" nudge 発火数（指数バックオフの n）
+        self._last_nudge_fire_ts: float = 0.0  # 沈黙 nudge 間バックオフのゲート
         
         self._idle_task: Optional[asyncio.Task] = None
 
@@ -58,8 +65,53 @@ class TalkMode(BaseMode):
         # 無言処理ループ開始
         self._idle_task = asyncio.create_task(self._idle_ellipsis_loop())
 
+        # Step 1.5 (g): instruction の PENDING → ACTIVE 遷移時に自発発話する callback を登録。
+        # ユーザーが黙っていても Eve が約束を履行できるようにする。
+        if self.task_manager is not None:
+            self.task_manager.register_instruction_activated_callback(
+                self._on_instruction_activated
+            )
+            self.log("System", "Instruction-activated callback registered", level="debug")
+
         self.log("System", "Talk Mode Ready - Speak now!")
-    
+
+    def _on_instruction_activated(self, instruction: dict) -> None:
+        """TaskManager から PENDING → ACTIVE 遷移時に呼ばれる callback（同期）。
+
+        ユーザー沈黙中でも Eve に約束を履行させるため、内部 user 入力として
+        `_pending_input_queue` に投入する。dispatch_loop が拾って _run_response_pipeline
+        を起動 → system prompt に [**!! 期限超過 !!**] が出る → Eve が約束を履行する。
+
+        Step 1.5 Fix Layer E E6: 前回 audit 失敗 (audit_reason) があれば nudge テキストに
+        付与して、 Eve に「前回未達成 → 今度は意味的に履行」を促す。
+
+        VLM nudge の "[内部: 画面に新しい変化があった ...]" 経路と同型。
+        """
+        try:
+            iid = instruction.get("id", "?")
+            text = instruction.get("instruction", "")
+            audit_reason = instruction.get("audit_reason")
+            if audit_reason:
+                payload = (
+                    f"[内部: 期限超過再判定 {iid} — 前回未達成「{audit_reason}」 "
+                    f"今度は内容的に履行 — {text}]"
+                )
+            else:
+                payload = f"[内部: 期限超過 {iid} を履行 — {text}]"
+            # Fix-6 P1-a: dict payload で is_internal_nudge=True を明示
+            self._pending_input_queue.put_nowait({
+                "text": payload,
+                "is_internal_nudge": True,
+            })
+            self.log(
+                "System",
+                f"Instruction-activated nudge enqueued: {iid}"
+                + (" (re-judge)" if audit_reason else ""),
+                level="debug",
+            )
+        except Exception as e:
+            self.log("System", f"_on_instruction_activated error: {e}", level="debug")
+
     async def shutdown(self):
         """対話モード固有の終了処理"""
         # 無言処理ループを停止
@@ -111,18 +163,31 @@ class TalkMode(BaseMode):
 
             self.state["last_ellipsis_ts"] = now
             if has_new_alert:
-                # alert 消費の高水位を更新（二重展開防止）
+                # alert 消費の高水位を更新（二重展開防止）。VLM nudge は沈黙 backoff と直交。
                 self.state["_vlm_alerts_consumed_at"] = now
                 await self._process_idle_input(
-                    "[内部: 画面に新しい変化があった - 自然にリアクションして]"
+                    "[内部: 画面に新しい変化があった - 自然にリアクションして]",
+                    is_silence_nudge=False,
                 )
             else:
-                await self._process_idle_input("…")
+                # A2: 沈黙 "…" nudge は指数バックオフで間隔を伸ばす（深い沈黙ほど引く）。
+                # last_ellipsis_ts は上で更新済 = 8s 再アームは維持しつつ、実発火はこのゲートで絞る。
+                interval = min(
+                    Config.IDLE_BASE_SEC
+                    * (Config.IDLE_BACKOFF_FACTOR ** self._nudge_streak_count),
+                    Config.IDLE_BACKOFF_CAP_SEC,
+                )
+                if now - self._last_nudge_fire_ts < interval:
+                    continue
+                self._last_nudge_fire_ts = now
+                await self._process_idle_input("…", is_silence_nudge=True)
 
-    async def _process_idle_input(self, input_text: str):
+    async def _process_idle_input(self, input_text: str, is_silence_nudge: bool = False):
         """無言時の自発発話処理（旧 _process_ellipsis）。
 
         ellipsis (…) と VLM nudge の両方で同じパスを使う。
+        is_silence_nudge=True は沈黙 "…" nudge（バックオフ・自己記憶の対象）、
+        False は VLM 画面変化 nudge（沈黙 backoff と直交、自己記憶には残さない）。
         VLM alert は llm._vlm_alerts に蓄積されているので、
         process_input → _build_system_prompt で自然に展開される。
         """
@@ -136,13 +201,34 @@ class TalkMode(BaseMode):
                 count=5, exclude_ellipsis=True,
             )
             self.llm.recent_turns = recent_turns
+
+            # A2: カテゴリ判定クロックは silence_seconds（最後の「実」ユーザ発話起点。
+            # 内部/期限超過 nudge では巻き戻らない信頼クロック。cold-start は 0.0 = early）。
+            sec = 0.0
             try:
-                self.llm.silence_summary = (
-                    await self.conversation_cache.get_silence_summary()
-                )
+                summary = await self.conversation_cache.get_silence_summary()
+                if isinstance(summary, dict):
+                    # 既存 [沈黙サマリ] の「(…) N回」表示を実 nudge 回数で正す
+                    # （nudge は cache 非保存のため元の ellipsis_count は常に 0）。
+                    summary["ellipsis_count"] = self._nudge_streak_count
+                    sec = float(summary.get("silence_seconds") or 0.0)
+                self.llm.silence_summary = summary
             except Exception as e:
                 self.log("System", f"silence_summary failed: {e}")
                 self.llm.silence_summary = None
+
+            if sec < Config.IDLE_EARLY_SEC:
+                category = "early"
+            elif sec < Config.IDLE_LONG_SEC:
+                category = "mid"
+            else:
+                category = "long"
+
+            # A1: この沈黙ストリークで既に言ったことを LLM に見せる（反復防止）。
+            self.llm.nudge_self_memory = list(self._nudge_spoken)
+            # 確認質問は 1 ストリーク 1 回まで（既に [check] があれば許可しない）。
+            check_done = any(m.get("category") == "check" for m in self._nudge_spoken)
+            allow_check = is_silence_nudge and category == "mid" and not check_done
 
             # VLMコンテキストを最新に更新
             if self.vlm_bridge and self.vlm_bridge.is_running:
@@ -150,7 +236,25 @@ class TalkMode(BaseMode):
                 if vlm_desc:
                     self.llm.vlm_context = vlm_desc
 
-            await self.process_input(input_text)
+            # Fix-6 P1-a: 「…」と VLM nudge は内部 nudge 扱い
+            # (conversation_cache / LLM history / RAG query を汚染しない)
+            response = await self.process_input(input_text, is_internal_nudge=True)
+
+            # A1: 沈黙 nudge の実発話のみ自己記憶に控える
+            # （VLM 反応は vlm_bridge 側に dedup があるので残さない＝バッファ汚染回避）。
+            if is_silence_nudge:
+                spoken = (response or "").strip()
+                if spoken and spoken != "…":
+                    rec_cat = (
+                        "check"
+                        if (allow_check and spoken.endswith(("？", "?")))
+                        else category
+                    )
+                    self._nudge_spoken.append({"category": rec_cat, "text": spoken[:80]})
+                    if len(self._nudge_spoken) > 8:
+                        self._nudge_spoken = self._nudge_spoken[-8:]
+                # 沈黙 nudge 発火ごとにバックオフ階段を1段進める。
+                self._nudge_streak_count += 1
         finally:
             self.state["busy_llm"] = False
     
@@ -210,6 +314,27 @@ class TalkMode(BaseMode):
             except Exception as e:
                 self.log("System", f"Audio listener error: {e}")
 
+    def _apply_dispatch_streak_state(self, is_internal_nudge: bool) -> None:
+        """dispatch 時の沈黙ストリーク状態を更新する（Fix-9a, テスト可能に分離）。
+
+        - 実ユーザターン (is_internal_nudge=False): ストリーク状態を全リセット。
+        - 内部 nudge (督促/期限超過 等, is_internal_nudge=True): idle 経路と同様に
+          nudge 自己記憶を引き継ぐ。この経路は _process_idle_input を通らないため、
+          ここで明示的にセットしないと回答ドリフト（猫→うさぎ）が起きる。
+        last_user_event_ts は読み出しゼロの dead フィールドのため書き込みを撤去済み。
+        """
+        now = time.time()
+        if not is_internal_nudge:
+            self._nudge_streak_count = 0
+            self._last_nudge_fire_ts = 0.0
+            self._nudge_spoken = []
+            if self.llm is not None:
+                self.llm.nudge_self_memory = []
+        else:
+            if self.llm is not None:
+                self.llm.nudge_self_memory = list(self._nudge_spoken)
+        self.state["idle_since_ts"] = now
+
     async def _dispatch_loop(self):
         """_pending_input_queue から取り出してマージ判断 + process_input を呼ぶ。
 
@@ -221,9 +346,18 @@ class TalkMode(BaseMode):
         self.log("System", "Dispatch loop started", level="debug")
         while self.running and not self.stop_requested:
             try:
-                user_text = await self._pending_input_queue.get()
+                payload = await self._pending_input_queue.get()
                 if self.stop_requested:
                     break
+
+                # Fix-6 P1-b: payload は dict or str。 dict なら is_internal_nudge を抽出。
+                # 後方互換: 文字列ペイロードは通常 user 発話扱い (is_internal_nudge=False)
+                if isinstance(payload, dict):
+                    user_text = payload.get("text", "")
+                    is_internal_nudge = bool(payload.get("is_internal_nudge", False))
+                else:
+                    user_text = payload
+                    is_internal_nudge = False
 
                 # リセットコマンド
                 if "リセット" in user_text:
@@ -231,41 +365,73 @@ class TalkMode(BaseMode):
                     self.log("System", "Context Reset")
                     continue
 
-                now = time.time()
-                self.state["last_user_event_ts"] = now
-                self.state["idle_since_ts"] = now
+                # Fix-6 P1-e: 内部 nudge は並行実行回避。 現在応答中なら queue 末尾に
+                # 再 put + 0.5 秒待機してリトライ (会話の二重化防止)。
+                if is_internal_nudge:
+                    if self.is_speaking() or (
+                        self._current_response_task is not None
+                        and not self._current_response_task.done()
+                    ):
+                        self.log(
+                            "System",
+                            "[Dispatch] internal nudge deferred (speaking, retry)",
+                            level="debug",
+                        )
+                        await asyncio.sleep(0.5)
+                        self._pending_input_queue.put_nowait({
+                            "text": user_text,
+                            "is_internal_nudge": True,
+                        })
+                        continue
+
+                # Fix-9a / A2: 沈黙ストリーク状態を更新（内部 nudge は自己記憶を引き継ぐ）。
+                self._apply_dispatch_streak_state(is_internal_nudge)
 
                 # Step 4: マージ判断（_pending_lock 内で atomic に）
+                # Step 1.5 Fix A1: 期限超過 nudge ([内部: 期限超過 ...]) はマージ禁止、
+                # 単独で処理する。is_speaking 中なら interrupt して優先発火させる。
                 should_inject_interrupt_marker = False
 
                 async with self._pending_lock:
-                    task = self._current_response_task
-                    tts_started = self.player.is_playing or not self.player.queue.empty()
-
-                    if task is not None and not task.done() and not tts_started:
-                        # ケース1: 入力1 が処理中 AND TTS 未開始 → マージ
-                        prev = self._pending_input or ""
-                        merged = (
-                            f"{prev}\n[追加: 続けて発話] {user_text}"
-                            if prev
-                            else user_text
-                        )
-                        input_to_process = merged
-                        self._pending_input = merged  # 連続 3 発以上に備えて更新
+                    if user_text.startswith("[内部: 期限超過"):
+                        # Fix A1: 期限超過 nudge は絶対優先で単独処理
+                        # Fix-6 P1-e: 並行実行回避は上で処理済み (interrupt しない)
+                        input_to_process = user_text
+                        self._pending_input = user_text
+                        # 内部 nudge は interrupt しない (Fix-6 P1-e)
                         self.log(
                             "System",
-                            f"[Merge] combined inputs ({len(merged)} chars): {merged[:80]}...",
+                            "[Dispatch] overdue priority, skip merge",
                             level="debug",
                         )
-                    elif self.is_speaking():
-                        # ケース2: TTS 再生中 or task 完了済みで再生残 → interrupt + 新応答
-                        input_to_process = user_text
-                        self._pending_input = user_text
-                        should_inject_interrupt_marker = True
                     else:
-                        # ケース3: IDLE → 通常処理
-                        input_to_process = user_text
-                        self._pending_input = user_text
+                        task = self._current_response_task
+                        tts_started = self.player.is_playing or not self.player.queue.empty()
+
+                        if task is not None and not task.done() and not tts_started:
+                            # ケース1: 入力1 が処理中 AND TTS 未開始 → マージ
+                            prev = self._pending_input or ""
+                            merged = (
+                                f"{prev}\n[追加: 続けて発話] {user_text}"
+                                if prev
+                                else user_text
+                            )
+                            input_to_process = merged
+                            self._pending_input = merged  # 連続 3 発以上に備えて更新
+                            self.log(
+                                "System",
+                                f"[Merge] combined inputs ({len(merged)} chars): {merged[:80]}...",
+                                level="debug",
+                            )
+                        elif self.is_speaking():
+                            # ケース2: TTS 再生中 or task 完了済みで再生残 → interrupt + 新応答
+                            input_to_process = user_text
+                            self._pending_input = user_text
+                            should_inject_interrupt_marker = True
+                        else:
+                            # ケース3: IDLE → 通常処理
+                            input_to_process = user_text
+                            self._pending_input = user_text
 
                 # interrupt は lock の外で実行（interrupt_async は内部で wait する）
                 if should_inject_interrupt_marker:
@@ -284,8 +450,12 @@ class TalkMode(BaseMode):
                 # 入力1 処理中でも入力2 をリアルタイムにマージ判断できる。
                 # process_input は内部で _cancel_current_response_if_any → _response_lock
                 # を取るため、複数 task が並列実行されることはない。
+                # Fix-6 P1-b: is_internal_nudge を伝搬する。
                 spawned = asyncio.create_task(
-                    self._run_input_with_cleanup(input_to_process)
+                    self._run_input_with_cleanup(
+                        input_to_process,
+                        is_internal_nudge=is_internal_nudge,
+                    )
                 )
                 self._spawned_input_tasks.add(spawned)
                 spawned.add_done_callback(self._spawned_input_tasks.discard)
@@ -294,13 +464,16 @@ class TalkMode(BaseMode):
             except Exception as e:
                 self.log("System", f"Dispatch loop error: {e}")
 
-    async def _run_input_with_cleanup(self, input_text: str):
+    async def _run_input_with_cleanup(
+        self, input_text: str, is_internal_nudge: bool = False
+    ):
         """process_input を呼んで、完了後に _pending_input をクリアする helper。
 
         dispatch_loop からは fire-and-forget で起動される。例外はログのみ。
+        Fix-6 P1-b: is_internal_nudge を process_input に伝搬する。
         """
         try:
-            await self.process_input(input_text)
+            await self.process_input(input_text, is_internal_nudge=is_internal_nudge)
         except asyncio.CancelledError:
             pass
         except Exception as e:
