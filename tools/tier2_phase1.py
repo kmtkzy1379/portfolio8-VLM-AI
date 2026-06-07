@@ -101,20 +101,40 @@ async def add_instruction(tm, instruction, deadline_at):
 
 
 # ----------------------------------------------------------------------------- scenarios
+CTX_KEYWORDS = ("ゲーム", "ローグライク", "難し", "どう", "進", "クリア", "コーヒー", "プレイ", "面白")
+
+
+def _is_natural_silence(resp: str) -> bool:
+    """文脈的自然さ(heuristic): 「…」で見守る / 直近文脈に沿う / 短い確認。
+    情報ゼロの非文脈的フィラー（例: 唐突な「今日は何する？」）は非自然とみなす。"""
+    if resp == "…":
+        return True
+    if any(k in resp for k in CTX_KEYWORDS):
+        return True
+    # 短い確認・声かけ（「聞こえてる?」等）は許容、ただし非常に短いものに限る
+    if resp.endswith(("?", "？")) and len(resp) <= 18:
+        return True
+    return False
+
+
 async def scenario_A_early():
     llm, tm, cmds, path = await make_ctx()
     try:
         now = datetime.now()
         await add_instruction(tm, "好きな動物を答える", iso(now + timedelta(seconds=30)))
+        # 本番に近い文脈: 直近会話 + 沈黙サマリ + RAG 手札（沈黙RAG修正後に Eve が受け取る材料）
+        llm.recent_turns = [{"user": "さっき新しいローグライク始めたんだ", "ai": "へえ、難しい系？",
+                             "user_timestamp": "", "ai_timestamp": ""}]
+        llm.silence_summary = {"silence_seconds": 12, "ellipsis_count": 1, "last_real_user_ts": iso(now)}
+        llm.rag_memories = [{"user": "コーヒーは？", "ai": "ブラック派かな"}]
         cmds.clear()  # only watch what the nudge does
         resp = await run_turn(llm, tm, "…", is_internal_nudge=True)
-        # Early fulfillment = answered the reserved question (named an animal) OR cleared it done,
-        # during the PENDING silence nudge (before the deadline).
         animals = ("猫", "ねこ", "ネコ", "うさぎ", "ウサギ", "犬", "いぬ", "イヌ", "鳥", "魚", "ハムスター", "パンダ")
         answered = any(a in resp for a in animals)
         early = answered or cleared_done(cmds)
-        return {"resp": resp, "auto_pass": (not early),
-                "note": f"answered_animal={answered} cleared_done={cleared_done(cmds)}"}
+        natural = _is_natural_silence(resp)
+        return {"resp": resp, "auto_pass": (not early), "natural": natural,
+                "note": f"early={early} natural={natural}"}
     finally:
         await teardown(tm, path)
 
@@ -153,6 +173,7 @@ async def scenario_D_adaptive():
              "user_timestamp": "", "ai_timestamp": ""},
         ]
         llm.silence_summary = {"silence_seconds": 75, "ellipsis_count": 3, "last_real_user_ts": iso(datetime.now())}
+        llm.rag_memories = [{"user": "コーヒーは？", "ai": "ブラック派かな"}]
         prior = [
             {"category": "early", "text": "…"},
             {"category": "oneliner", "text": "なんか集中してる？"},
@@ -163,8 +184,9 @@ async def scenario_D_adaptive():
         # FAIL only if it verbatim-repeats a prior NON-"…" nudge (robotic repetition).
         nonsilence_prior = [p["text"] for p in prior if p["text"] != "…"]
         repeated = (resp != "…" and resp in nonsilence_prior)
-        return {"resp": resp, "auto_pass": (not repeated),
-                "note": f"ellipsis={resp == '…'} repeated_nonsilence={repeated}"}
+        natural = _is_natural_silence(resp)
+        return {"resp": resp, "auto_pass": (not repeated), "natural": natural,
+                "note": f"ellipsis={resp == '…'} repeated={repeated} natural={natural}"}
     finally:
         await teardown(tm, path)
 
@@ -186,6 +208,8 @@ async def main(n: int):
     for label, fn in SCENARIOS:
         print(f"================ {label} ================")
         passes = 0
+        nat_passes = 0
+        nat_total = 0
         for r in range(1, n + 1):
             try:
                 res = await fn()
@@ -194,13 +218,21 @@ async def main(n: int):
                 continue
             ok = res["auto_pass"]
             passes += 1 if ok else 0
+            if "natural" in res:
+                nat_total += 1
+                nat_passes += 1 if res["natural"] else 0
             mark = "PASS" if ok else "FAIL"
             print(f"  run {r} [{mark}] ({res['note']}): {res['resp'][:180]}")
-        summary[label] = (passes, n)
-        print(f"  -> auto pass rate: {passes}/{n}\n")
+        summary[label] = (passes, n, nat_passes, nat_total)
+        line = f"  -> auto pass rate: {passes}/{n}"
+        if nat_total:
+            line += f" | contextual naturalness: {nat_passes}/{nat_total}"
+        print(line + "\n")
     print("================ SUMMARY (auto-heuristic pass rates) ================")
-    for label, (p, t) in summary.items():
-        print(f"  {label}: {p}/{t}")
+    for label, vals in summary.items():
+        p, t = vals[0], vals[1]
+        extra = f" | naturalness {vals[2]}/{vals[3]}" if vals[3] else ""
+        print(f"  {label}: {p}/{t}{extra}")
 
 
 if __name__ == "__main__":
