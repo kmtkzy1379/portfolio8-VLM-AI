@@ -239,6 +239,36 @@ async def test_capture_maybe_commit_fact() -> None:
         await _teardown(tm, path)
 
 
+async def test_release_facts_on_supersede() -> None:
+    print("\n--- Fix-9b: user-cancel (superseded) releases the fact; DONE keeps it ---")
+    tm, path = await _make_tm()
+    try:
+        now = datetime.now()
+        await _add_instruction(tm, "好きな動物を答える", iso(now + timedelta(seconds=30)))
+        iid = next(iter(tm._active_instructions.keys()))
+        await _commit_fact(tm, "好きな動物", "猫だよ", iid=iid)
+        check("fact active before cancel", len(tm.get_committed_facts_for_prompt()) == 1)
+
+        # user explicitly cancels the reservation -> SUPERSEDED -> fact released
+        tm.enqueue_command_nowait({"kind": "clear_active_instruction", "id": iid,
+                                   "status": "superseded", "reason": "ユーザー取消し"})
+        await tm.flush_command_queue()
+        check("fact released after user-cancel (not in prompt)",
+              tm.get_committed_facts_for_prompt() == [], f"facts={tm.get_committed_facts_for_prompt()}")
+
+        # a DIFFERENT instruction fulfilled normally (DONE, no eve_response) -> fact KEPT (persona-durable)
+        await _add_instruction(tm, "好きな色を答える", iso(now + timedelta(seconds=30)))
+        iid2 = [k for k in tm._active_instructions.keys() if k != iid][0]
+        await _commit_fact(tm, "好きな色", "青", iid=iid2)
+        tm.enqueue_command_nowait({"kind": "clear_active_instruction", "id": iid2,
+                                   "status": "done", "reason": "履行"})
+        await tm.flush_command_queue()
+        topics = {f["topic"] for f in tm.get_committed_facts_for_prompt()}
+        check("DONE keeps fact active (persona-durable)", "好きな色" in topics, f"topics={topics}")
+    finally:
+        await _teardown(tm, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
@@ -247,6 +277,7 @@ async def main() -> None:
     await test_committed_fact_defend()
     await test_committed_fact_recovery()
     await test_capture_maybe_commit_fact()
+    await test_release_facts_on_supersede()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)

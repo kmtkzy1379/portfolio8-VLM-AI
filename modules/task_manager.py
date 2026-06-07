@@ -1211,6 +1211,10 @@ class TaskManager:
 
         # eve_response 無し（audit 無効環境）or status=superseded → 従来通り即時クリア
         inst.status = new_status
+        # Fix-9b: ユーザーが予約を明示取消（superseded）したら、紐づくコミット事実も superseded に。
+        # DONE（履行完了）では eve-fact を active のまま残す（ペルソナ持続 = 一度言った好みは消えない）。
+        if new_status == InstructionStatus.SUPERSEDED:
+            self._release_facts_for_instruction(iid, "superseded")
         inst.cleared_at = now_iso()
         inst.cleared_reason = reason
         self._activated_callback_fired.discard(iid)
