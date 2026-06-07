@@ -138,11 +138,78 @@ async def test_correct_timing() -> None:
         await _teardown(tm, path)
 
 
+async def _commit_fact(tm: TaskManager, topic: str, answer: str,
+                       iid: str | None = None, scope: str = "eve", source: str = "nudge") -> None:
+    tm.enqueue_command_nowait({
+        "kind": "commit_fact",
+        "scope": scope,
+        "topic_norm": topic,
+        "answer_text": answer,
+        "instruction_id": iid,
+        "source": source,
+    })
+    await tm.flush_command_queue()
+
+
+async def test_committed_fact_defend() -> None:
+    print("\n--- Fix-9b: committed-fact store DEFENDS the first answer (anti-drift) ---")
+    tm, path = await _make_tm()
+    try:
+        await _commit_fact(tm, "好きな動物", "猫だよ", iid="i_x")
+        facts = tm.get_committed_facts_for_prompt()
+        check("first commit stored", facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+
+        # Drift attempt: same topic, different answer -> must be DEFENDED (not overwritten).
+        await _commit_fact(tm, "好きな動物", "うさぎ", iid="i_x")
+        facts = tm.get_committed_facts_for_prompt()
+        check("drift defended: still 猫だよ (not うさぎ)",
+              facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+        n_active = len([f for f in tm._committed_facts.values() if f.status == "active"])
+        check("no duplicate fact created", n_active == 1, f"active={n_active}")
+
+        # A different topic coexists.
+        await _commit_fact(tm, "好きな色", "青", iid="i_y")
+        topics = {f["topic"]: f["answer"] for f in tm.get_committed_facts_for_prompt()}
+        check("second topic coexists, first unchanged",
+              topics.get("好きな色") == "青" and topics.get("好きな動物") == "猫だよ", f"topics={topics}")
+    finally:
+        await _teardown(tm, path)
+
+
+async def test_committed_fact_recovery() -> None:
+    print("\n--- Fix-9b: committed facts persist across restart (persona-durable) ---")
+    fd, path = tempfile.mkstemp(suffix="_tasks.jsonl")
+    os.close(fd)
+    open(path, "w", encoding="utf-8").close()
+    tm1 = TaskManager(tasks_file=path)
+    await tm1.start()
+    try:
+        await _commit_fact(tm1, "好きな動物", "猫だよ", iid="i_x")
+        await tm1._write_queue.join()  # ensure persisted to disk before restart
+    finally:
+        try:
+            await tm1.stop()
+        except Exception:
+            pass
+    await asyncio.sleep(0.05)
+
+    tm2 = TaskManager(tasks_file=path)  # new instance, same file
+    await tm2.start()
+    try:
+        facts = tm2.get_committed_facts_for_prompt()
+        check("fact restored after restart",
+              facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+    finally:
+        await _teardown(tm2, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
     await test_fix_b2_previous_day()
     await test_correct_timing()
+    await test_committed_fact_defend()
+    await test_committed_fact_recovery()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)

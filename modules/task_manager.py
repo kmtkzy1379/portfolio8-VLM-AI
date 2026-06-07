@@ -30,11 +30,13 @@ from typing import Callable, Optional
 from config import Config
 from modules.task_schema import (
     ActiveInstruction,
+    CommittedFact,
     InstructionStatus,
     Plan,
     Task,
     TaskPriority,
     TaskStatus,
+    new_fact_id,
     new_instruction_id,
     new_plan_id,
     now_iso,
@@ -99,6 +101,9 @@ class TaskManager:
         self._activated_callback_fired: set[str] = set()
         # Step 1.5 Fix Layer E: 同一 PROVISIONAL_DONE に対する audit 二重発火防止 set
         self._audit_spawned_ids: set[str] = set()
+        # Fix-9b: コミット事実 / 一貫性ストア（fact_id -> CommittedFact）。
+        # 回答ドリフト（猫→うさぎ）防止。active なものだけ system prompt に注入（ペルソナ持続）。
+        self._committed_facts: dict[str, CommittedFact] = {}
 
     # ==================================================================
     # Public read API（sync fast path、lock を取らない）
@@ -469,6 +474,8 @@ class TaskManager:
                     await self._handle_confirm_provisional_done(cmd)
                 elif kind == "revert_provisional_done":
                     await self._handle_revert_provisional_done(cmd)
+                elif kind == "commit_fact":
+                    await self._handle_commit_fact(cmd)
                 else:
                     logger.debug("[TaskManager] unknown command kind=%s", kind)
             finally:
@@ -523,6 +530,8 @@ class TaskManager:
         # Step 1.5: active_instruction の復元
         instruction_records: dict[str, dict] = {}  # id -> 最新の active_instruction record
         instruction_status_updates: list[dict] = []  # instruction_status の時系列
+        # Fix-9b: committed_fact の復元
+        committed_fact_records: dict[str, dict] = {}  # fact_id -> 最新の committed_fact record
         for raw in lines:
             raw = raw.strip()
             if not raw:
@@ -549,6 +558,22 @@ class TaskManager:
                     instruction_records[iid] = entry
             elif kind == "instruction_status":
                 instruction_status_updates.append(entry)
+            elif kind == "committed_fact":
+                fid = entry.get("fact_id", "")
+                if fid:
+                    committed_fact_records[fid] = entry
+
+        # Fix-9b: committed_fact を復元（plan の有無に関係なく load = ペルソナ持続）。
+        # 同 fact_id の最新レコードが status を確定（active のみ in-memory に載せる）。
+        for fid, rec in committed_fact_records.items():
+            try:
+                fact = CommittedFact.from_jsonable(rec)
+            except Exception:  # noqa: BLE001
+                continue
+            if fact.status == "active":
+                self._committed_facts[fact.fact_id] = fact
+        if self._committed_facts:
+            task_logger.info("[TaskManager] restored %d committed_facts", len(self._committed_facts))
 
         # 最新の非 superseded plan を選ぶ
         active_plan_meta = None
@@ -796,6 +821,80 @@ class TaskManager:
                     pass
             result.append(item)
         return result
+
+    # ==================================================================
+    # Fix-9b: committed-fact / 一貫性ストア
+    # ==================================================================
+    def get_instruction(self, iid: str) -> Optional[dict]:
+        """instruction id から軽い dict を返す（capture 用 sync fast path）。None if 不在。"""
+        inst = self._active_instructions.get(iid)
+        if inst is None:
+            return None
+        return {"id": inst.id, "instruction": inst.instruction, "status": inst.status.value}
+
+    async def _handle_commit_fact(self, cmd: dict) -> None:
+        """Fix-9b: Eve がコミットした回答を一貫性ストアに記録する。
+        既に同 (scope, topic_norm) の active fact があれば **最初の答えを守る**（上書きしない）。
+        これが回答ドリフト防止の核心。"""
+        scope = cmd.get("scope", "eve")
+        topic_norm = (cmd.get("topic_norm") or "").strip()
+        answer_text = (cmd.get("answer_text") or "").strip()
+        if not topic_norm or not answer_text:
+            return
+        instruction_id = cmd.get("instruction_id")
+        # Defend: 同じ話題に active な事実が既にあれば最初の答えを保持。
+        for f in self._committed_facts.values():
+            if f.status == "active" and f.scope == scope and f.topic_norm == topic_norm:
+                if f.instruction_id is None and instruction_id:
+                    f.instruction_id = instruction_id  # link を補完するだけ（答えは保持）
+                task_logger.debug(
+                    "[CommitFact] defended %s 〈%s=%s〉, ignored new answer",
+                    f.fact_id, topic_norm, f.answer_text[:30],
+                )
+                return
+        fact = CommittedFact(
+            fact_id=new_fact_id(),
+            topic_norm=topic_norm,
+            answer_text=answer_text[:120],
+            scope=scope,
+            instruction_id=instruction_id,
+            committed_at=now_iso(),
+            source=cmd.get("source", "nudge"),
+            status="active",
+        )
+        self._committed_facts[fact.fact_id] = fact
+        self._evict_committed_facts_over_cap(32)
+        await self._write_queue.put({"_kind": "committed_fact", **fact.to_jsonable()})
+        task_logger.info("[CommitFact] committed %s 〈%s = %s〉", fact.fact_id, topic_norm, fact.answer_text[:30])
+
+    def _evict_committed_facts_over_cap(self, cap: int) -> None:
+        """active なコミット事実が cap を超えたら最古から落とす（メモリ/プロンプト保護）。"""
+        active = [f for f in self._committed_facts.values() if f.status == "active"]
+        if len(active) <= cap:
+            return
+        active.sort(key=lambda f: f.committed_at)
+        for f in active[: len(active) - cap]:
+            self._committed_facts.pop(f.fact_id, None)
+
+    def get_committed_facts_for_prompt(self, limit: int = 6) -> list[dict]:
+        """system prompt 注入用に active なコミット事実を返す（sync fast path）。
+        最新 limit 件、 {topic, answer} の配列。"""
+        active = [f for f in self._committed_facts.values() if f.status == "active"]
+        active.sort(key=lambda f: f.committed_at)
+        return [{"topic": f.topic_norm, "answer": f.answer_text} for f in active[-limit:]]
+
+    def _release_facts_for_instruction(self, iid: str, new_status: str) -> None:
+        """instruction の終端遷移に伴い紐づく fact の status を更新。
+        DONE では eve-fact を active のまま残す（ペルソナ持続）。SUPERSEDED で superseded。"""
+        if not iid:
+            return
+        for f in self._committed_facts.values():
+            if f.instruction_id == iid and f.status == "active":
+                f.status = new_status
+                try:
+                    self._write_queue.put_nowait({"_kind": "committed_fact", **f.to_jsonable()})
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _compute_derived_status(
         self, inst: ActiveInstruction, now: datetime

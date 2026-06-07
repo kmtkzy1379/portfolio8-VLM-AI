@@ -171,3 +171,41 @@ class ActiveInstruction:
             audit_reason=d.get("audit_reason"),
             provisional_response=d.get("provisional_response"),
         )
+
+
+def new_fact_id() -> str:
+    return "cf_" + uuid.uuid4().hex[:8]
+
+
+@dataclass
+class CommittedFact:
+    """Fix-9b: Eve が一度コミットした回答 / 嗜好（一貫性ストア・ペルソナ持続）。
+
+    回答ドリフト（例: 好きな動物を「猫」と言った後「うさぎ」に化ける）を防ぐ。
+    既定は「守る（firm）」: 一度コミットした答えを理由なく上書きしない。
+    scope="eve"（自分の嗜好/回答=firm, 持続）と scope="user"（ユーザー事実=Phase2）を区別。
+    """
+    fact_id: str
+    topic_norm: str               # _normalize_instruction(instruction) でキー化
+    answer_text: str              # 最初にコミットした回答（verbatim, cap 済み）
+    scope: str = "eve"            # "eve" | "user"
+    instruction_id: Optional[str] = None
+    committed_at: str = ""
+    source: str = "nudge"         # "nudge" | "idle" | "conversation"
+    status: str = "active"        # "active" | "released" | "superseded"
+
+    def to_jsonable(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_jsonable(cls, d: dict) -> "CommittedFact":
+        return cls(
+            fact_id=d["fact_id"],
+            topic_norm=d.get("topic_norm", ""),
+            answer_text=d.get("answer_text", ""),
+            scope=d.get("scope", "eve"),
+            instruction_id=d.get("instruction_id"),
+            committed_at=d.get("committed_at", ""),
+            source=d.get("source", "nudge"),
+            status=d.get("status", "active"),
+        )
