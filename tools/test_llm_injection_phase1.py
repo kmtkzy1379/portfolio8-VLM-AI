@@ -54,13 +54,13 @@ def run() -> None:
         return
     check("_build_system_prompt runs without error", True)
     check("committed-facts block header present",
-          "既にコミットした自分の答え" in prompt)
+          "中身(substance)は firm" in prompt)
     check("committed fact value rendered (好きな動物 = 猫だよ)",
           "好きな動物 = 猫だよ" in prompt)
     check("anti-drift wording present (猫→うさぎ禁止)",
           "猫と言ったのに後でうさぎ" in prompt)
-    check("firm-but-not-robotic wording present",
-          "表現は毎回少し変えてよいが、答えの中身は保つ" in prompt)
+    check("expression-diversity wording present (表現は毎回変える)",
+          "表現は毎回変える" in prompt)
     check("Phase-0 nudge self-memory block also renders",
           "この沈黙中に自分が既に言ったこと" in prompt)
 
@@ -68,11 +68,66 @@ def run() -> None:
     llm.committed_facts = []
     prompt2 = llm._build_system_prompt("…")
     check("no committed-facts block when store empty",
-          "既にコミットした自分の答え" not in prompt2)
+          "中身(substance)は firm" not in prompt2)
+
+
+async def test_fix8_gate() -> None:
+    import tempfile
+    from datetime import datetime, timedelta
+    from modules.task_manager import TaskManager
+    print("\n--- Fix-8 code gate: PENDING block hidden on internal nudge, shown on user turn ---")
+    fd, path = tempfile.mkstemp(suffix="_fix8.jsonl")
+    os.close(fd)
+    open(path, "w", encoding="utf-8").close()
+    tm = TaskManager(tasks_file=path)
+    await tm.start()
+    try:
+        tm.enqueue_command_nowait({
+            "kind": "set_active_instruction", "instruction": "好きな動物を答える",
+            "deadline_at": (datetime.now() + timedelta(seconds=60)).isoformat(),
+            "reason": "t", "created_by": "ai1",
+        })
+        await tm.flush_command_queue()
+        llm = LLMHandler()
+        llm.system_prompt = "テスト用システムプロンプト"
+        llm.recent_turns = []
+        llm.silence_summary = None
+        llm.committed_facts = []
+        llm.nudge_self_memory = []
+        llm.rag_memories = []
+        llm.vlm_context = ""
+        llm.one_shot_context = ""
+        llm.set_task_manager(tm)
+
+        # Real user turn: the PENDING reservation IS visible (so Eve can act if asked).
+        llm._suppress_pending_block = False
+        p_user = llm._build_system_prompt("好きな動物おしえて")
+        check("PENDING reservation visible on real user turn", "好きな動物を答える" in p_user)
+
+        # Internal / silence nudge: the PENDING reservation is HIDDEN (no early fulfillment).
+        llm._suppress_pending_block = True
+        p_nudge = llm._build_system_prompt("…")
+        check("PENDING reservation hidden on internal/silence nudge",
+              "好きな動物を答える" not in p_nudge)
+    finally:
+        try:
+            await tm.stop()
+        except Exception:
+            pass
+        await asyncio.sleep(0.02)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _amain() -> None:
+    run()
+    await test_fix8_gate()
 
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(_amain())
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
     print(f"\n=== {npass}/{total} checks passed ===")

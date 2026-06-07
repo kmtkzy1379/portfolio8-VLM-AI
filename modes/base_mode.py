@@ -326,6 +326,7 @@ class BaseMode(ABC):
 
             # RAG検索（800msタイムアウト）
             rag_memories = []
+            rag_query = ""
             try:
                 # Phase 4.3.2: top_k は Config.FB_RAG_TOP_K (default 4) を使う
                 # MMR による多様性確保が効くため top_k 拡大しても重複しない
@@ -351,7 +352,12 @@ class BaseMode(ABC):
             # RAGと直近ターンをLLMに設定
             # exclude_ellipsis=True: 内部見守り発話「…」を recent_turns から除外
             #   (沈黙時に直前の実会話が押し出される問題への対策)
-            self.llm.rag_memories = rag_memories
+            # Fix(沈黙RAG): 内部 nudge で RAG search を skip した場合（idle「…」, rag_query=""）、
+            # _process_idle_input が事前にセットした random RAG memories（沈黙時の話題タネ）を
+            # [] で上書きして消さない。実際に search した時 / 通常ユーザターン時のみ上書きする。
+            # これが無いと沈黙時に Eve が手札ゼロになり、不自然な無難発話になる。
+            if rag_query or not is_internal_nudge:
+                self.llm.rag_memories = rag_memories
             recent_turns = await self.conversation_cache.get_recent_turns(
                 count=5, exclude_ellipsis=True,
             )
