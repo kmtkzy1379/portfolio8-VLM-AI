@@ -791,6 +791,9 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # PENDING / EXPIRING → goal_block の前（穏やか表示）
         # ACTIVE → goal_block の後（最強位置で「期限超過」を強調表示）
         instruction_pending_block, instruction_active_block = self._build_instruction_blocks(now_dt)
+        # Fix-8 (code gate): 内部 nudge では PENDING ブロックを抑制し、早期履行を防ぐ。ACTIVE は残す。
+        if getattr(self, "_suppress_pending_block", False):
+            instruction_pending_block = ""
 
         # 組み立て
         base_content = self.system_prompt
@@ -1088,6 +1091,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # Fix-6 P1-d 順序修正: one_shot_context を先にセットしてから system prompt 構築
         if is_internal_nudge:
             self.one_shot_context = f"[内部通知]: {user_text}"
+        # Fix-8 (code gate): 内部 nudge（沈黙/督促）では PENDING 予約ブロックを隠す。
+        # 沈黙中に PENDING を見せると期限前に先回り履行してしまう（Tier-2 で prompt のみでは 0/5）。
+        # ACTIVE（[期限超過]）ブロックは隠さないので、期限到来後の履行は通常どおり行われる。
+        self._suppress_pending_block = is_internal_nudge
 
         # システムプロンプト動的再構築
         if self.history[0]["role"] == "system":
