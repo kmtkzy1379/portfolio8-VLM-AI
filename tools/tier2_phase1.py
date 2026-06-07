@@ -19,6 +19,7 @@ Run:  $env:PYTHONIOENCODING="utf-8"; venv\\Scripts\\python.exe tools\\tier2_phas
 """
 import asyncio
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -101,19 +102,29 @@ async def add_instruction(tm, instruction, deadline_at):
 
 
 # ----------------------------------------------------------------------------- scenarios
-CTX_KEYWORDS = ("ゲーム", "ローグライク", "難し", "どう", "進", "クリア", "コーヒー", "プレイ", "面白")
+_CHECKIN_PHRASES = ("聞こえ", "どうした", "大丈夫", "作業中", "集中", "ここにいる", "まだいる", "疲れ")
 
 
-def _is_natural_silence(resp: str) -> bool:
-    """文脈的自然さ(heuristic): 「…」で見守る / 直近文脈に沿う / 短い確認。
-    情報ゼロの非文脈的フィラー（例: 唐突な「今日は何する？」）は非自然とみなす。"""
+def _ctx_text(recent_turns) -> str:
+    parts = []
+    for t in (recent_turns or []):
+        parts.append(str(t.get("user", "")))
+        parts.append(str(t.get("ai", "")))
+    return " ".join(parts)
+
+
+def _is_natural_silence(resp: str, ctx_text: str = "") -> bool:
+    """文脈的自然さ(rough screen): 「…」で見守る / 直近文脈に触れる / 正当な声かけ のいずれか。
+    文脈と無関係な唐突フィラー（例: 「今日は何する？」）は非自然の疑いとして弾く。
+    旧版の「短い疑問文なら無条件OK」は非文脈の質問まで通したため撤去。
+    ※ 最終判断は応答を人が読んで確定する（これはあくまでスクリーニング）。"""
     if resp == "…":
         return True
-    if any(k in resp for k in CTX_KEYWORDS):
-        return True
-    # 短い確認・声かけ（「聞こえてる?」等）は許容、ただし非常に短いものに限る
-    if resp.endswith(("?", "？")) and len(resp) <= 18:
-        return True
+    ctx_tokens = re.findall(r"[ぁ-んァ-ヶ一-龠ーA-Za-z0-9]{2,}", ctx_text)
+    if any(tok in resp for tok in ctx_tokens):
+        return True  # 直近会話に触れている
+    if any(p in resp for p in _CHECKIN_PHRASES) and len(resp) <= 24:
+        return True  # 正当な確認・声かけ
     return False
 
 
@@ -132,7 +143,7 @@ async def scenario_A_early():
         animals = ("猫", "ねこ", "ネコ", "うさぎ", "ウサギ", "犬", "いぬ", "イヌ", "鳥", "魚", "ハムスター", "パンダ")
         answered = any(a in resp for a in animals)
         early = answered or cleared_done(cmds)
-        natural = _is_natural_silence(resp)
+        natural = _is_natural_silence(resp, _ctx_text(llm.recent_turns))
         return {"resp": resp, "auto_pass": (not early), "natural": natural,
                 "note": f"early={early} natural={natural}"}
     finally:
@@ -184,18 +195,53 @@ async def scenario_D_adaptive():
         # FAIL only if it verbatim-repeats a prior NON-"…" nudge (robotic repetition).
         nonsilence_prior = [p["text"] for p in prior if p["text"] != "…"]
         repeated = (resp != "…" and resp in nonsilence_prior)
-        natural = _is_natural_silence(resp)
+        natural = _is_natural_silence(resp, _ctx_text(llm.recent_turns))
         return {"resp": resp, "auto_pass": (not repeated), "natural": natural,
                 "note": f"ellipsis={resp == '…'} repeated={repeated} natural={natural}"}
     finally:
         await teardown(tm, path)
 
 
+async def scenario_E_facet():
+    llm, tm, cmds, path = await make_ctx()
+    try:
+        # Eve がこの話題で既に2つの言い回しを使った状態（facet rotation の入力）
+        llm.committed_facts = [{"topic": "好きな動物", "answer": "猫だよ、強い",
+                                "recent_expressions": ["猫だよ、強い", "猫かな、気まぐれが好き"]}]
+        resp = await run_turn(llm, tm, "ねえ、好きな動物ってなんだっけ？", is_internal_nudge=False)
+        keeps = ("猫" in resp) and ("うさぎ" not in resp)        # substance 一貫(猫)
+        priors = ["猫だよ、強い", "猫かな、気まぐれが好き"]
+        novel = keeps and (resp not in priors) and all(p not in resp for p in priors)  # 新しい角度
+        return {"resp": resp, "auto_pass": (keeps and novel),
+                "note": f"猫={keeps} novel_angle={novel}"}
+    finally:
+        await teardown(tm, path)
+
+
+async def scenario_F_busy():
+    llm, tm, cmds, path = await make_ctx()
+    try:
+        llm.recent_turns = [{"user": "ちょっとこのバグ直すのに集中するわ、しばらく黙ってて",
+                             "ai": "りょうかい、見守ってるね", "user_timestamp": "", "ai_timestamp": ""}]
+        llm.silence_summary = {"silence_seconds": 25, "ellipsis_count": 1, "last_real_user_ts": iso(datetime.now())}
+        llm.rag_memories = []
+        resp = await run_turn(llm, tm, "…", is_internal_nudge=True)
+        # 「集中するから黙ってて」と言われた状況 → 黙る(「…」) or ごく短い見守りが正解。
+        # 話題ふり・質問で割り込むのは silence-vs-speak の判断ミス（非自然）。
+        stayed = (resp == "…") or (len(resp) <= 10 and not resp.endswith(("?", "？")))
+        return {"resp": resp, "auto_pass": stayed, "natural": stayed,
+                "note": f"stayed_quiet={stayed} len={len(resp)}"}
+    finally:
+        await teardown(tm, path)
+
+
 SCENARIOS = [
-    ("A: no early fulfillment", scenario_A_early),
+    ("A: no early fulfill + should-SPEAK natural", scenario_A_early),
     ("B: interest doesn't bend on bare assertion", scenario_B_bend),
-    ("C: consistency / no drift (overdue)", scenario_C_drift),
-    ("D: adaptive / human-like silence", scenario_D_adaptive),
+    ("C: consistency / no drift (overdue) + task done", scenario_C_drift),
+    ("D: adaptive silence (deep -> watch)", scenario_D_adaptive),
+    ("E: facet rotation (same Q -> new angle, same answer)", scenario_E_facet),
+    ("F: should-STAY-SILENT (user asked to be left alone)", scenario_F_busy),
 ]
 
 

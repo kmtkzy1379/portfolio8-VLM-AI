@@ -842,25 +842,33 @@ class TaskManager:
         if not topic_norm or not answer_text:
             return
         instruction_id = cmd.get("instruction_id")
-        # Defend: 同じ話題に active な事実が既にあれば最初の答えを保持。
+        ans = answer_text[:120]
+        # Defend: 同じ話題に active な事実が既にあれば中身(answer_text)は保持。
+        # ① Facet rotation: 新しい言い回しは recent_expressions に蓄積（表現の多様化用）。
         for f in self._committed_facts.values():
             if f.status == "active" and f.scope == scope and f.topic_norm == topic_norm:
                 if f.instruction_id is None and instruction_id:
-                    f.instruction_id = instruction_id  # link を補完するだけ（答えは保持）
+                    f.instruction_id = instruction_id  # link 補完（中身は保持）
+                if ans and ans not in f.recent_expressions:
+                    f.recent_expressions.append(ans)
+                    if len(f.recent_expressions) > 4:
+                        f.recent_expressions = f.recent_expressions[-4:]
+                    await self._write_queue.put({"_kind": "committed_fact", **f.to_jsonable()})
                 task_logger.debug(
-                    "[CommitFact] defended %s 〈%s=%s〉, ignored new answer",
-                    f.fact_id, topic_norm, f.answer_text[:30],
+                    "[CommitFact] defended %s 〈%s〉, recorded expression variant 〈%s〉",
+                    f.fact_id, f.answer_text[:24], ans[:24],
                 )
                 return
         fact = CommittedFact(
             fact_id=new_fact_id(),
             topic_norm=topic_norm,
-            answer_text=answer_text[:120],
+            answer_text=ans,
             scope=scope,
             instruction_id=instruction_id,
             committed_at=now_iso(),
             source=cmd.get("source", "nudge"),
             status="active",
+            recent_expressions=[ans],
         )
         self._committed_facts[fact.fact_id] = fact
         self._evict_committed_facts_over_cap(32)
@@ -881,7 +889,11 @@ class TaskManager:
         最新 limit 件、 {topic, answer} の配列。"""
         active = [f for f in self._committed_facts.values() if f.status == "active"]
         active.sort(key=lambda f: f.committed_at)
-        return [{"topic": f.topic_norm, "answer": f.answer_text} for f in active[-limit:]]
+        return [
+            {"topic": f.topic_norm, "answer": f.answer_text,
+             "recent_expressions": list(f.recent_expressions)}
+            for f in active[-limit:]
+        ]
 
     def _release_facts_for_instruction(self, iid: str, new_status: str) -> None:
         """instruction の終端遷移に伴い紐づく fact の status を更新。

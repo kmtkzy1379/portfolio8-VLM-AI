@@ -658,18 +658,23 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         committed_facts_context = ""
         _cf = getattr(self, "committed_facts", None)
         if _cf:
-            _cf_lines = "\n".join(
-                f"  - 〈{c.get('topic', '?')} = {c.get('answer', '')}〉" for c in _cf[-6:]
-            )
+            _cf_lines = []
+            for c in _cf[-6:]:
+                _line = f"  - 〈{c.get('topic', '?')} = {c.get('answer', '')}〉"
+                _exprs = c.get("recent_expressions") or []
+                if len(_exprs) > 1:
+                    _line += "（既出の言い回し: " + " / ".join(f"「{e}」" for e in _exprs[-3:]) + "）"
+                _cf_lines.append(_line)
+            _cf_block = "\n".join(_cf_lines)
             committed_facts_context = (
                 "[一貫性: 中身(substance)は firm、表現(expression)は毎回多様に]:\n"
-                f"{_cf_lines}\n"
+                f"{_cf_block}\n"
                 "  【中身は守る】前に答えた内容を別の答えにすり替えない（猫と言ったのに後でうさぎ、は禁止）。"
                 "沈黙中や期限超過の催促でも同じ。変えてよいのは自分が体験・強い理由で考えを改めたとき、"
                 "またはユーザーが明確な理由を示したときだけ。尋ね直された／沈黙が続いただけでは変えない。\n"
                 "  【表現は毎回変える】同じ答えでも、言い回し・感情・詳細度・切り口を毎ターン意識して変える。"
-                "同じ言い方を繰り返さない。たとえば「猫」でも: 「猫だよ、強い」/「…猫。やっぱり猫」/"
-                "「猫かな。あの気まぐれが好き」/「猫ですね、なんか惹かれる」のように毎回ちがう顔で。\n\n"
+                "「既出の言い回し」が示されていたら、それを繰り返さず別の角度（理由・エピソード・トーン）で答える。"
+                "例「猫」: 「猫だよ、強い」/「…猫。やっぱり猫」/「猫かな、あの気まぐれが好き」/「猫ですね、なんか惹かれる」。\n\n"
             )
 
         # 直近5ターン (「…」は除外済み、生は base_mode 側でフィルタ)
@@ -1200,7 +1205,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 messages=self.history,
                 tools=tools_for_call,
                 tool_choice="auto",
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1210,7 +1216,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 messages=self.history,
                 tools=tools_for_call,
                 tool_choice="auto",
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
                 max_tokens=self._fallback_max_tokens,
             )
 
@@ -1348,7 +1355,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 model=self.model,
                 messages=self.history,
                 stream=True,
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1357,7 +1365,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 model=self._fallback_model,
                 messages=self.history,
                 stream=True,
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
                 max_tokens=self._fallback_max_tokens,
             )
 

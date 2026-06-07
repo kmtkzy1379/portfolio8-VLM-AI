@@ -20,6 +20,9 @@ class Config:
 
     # Models
     AI1_MODEL = os.getenv("AI1_MODEL_NAME", "llama-3.3-70b-versatile")
+    # ① Diversity: AI1 サンプリング（多様な応答のため。従来 0.7 固定から引き上げ）
+    AI1_TEMPERATURE = float(os.getenv("AI1_TEMPERATURE", "0.85"))
+    AI1_TOP_P = float(os.getenv("AI1_TOP_P", "0.9"))
     AI2_MODEL = os.getenv("AI2_MODEL_NAME", "claude-opus-4-5")
     AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-4o")
     AI2_MAX_TOKENS = int(os.getenv("AI2_MAX_TOKENS", "4000"))
