@@ -314,6 +314,27 @@ class TalkMode(BaseMode):
             except Exception as e:
                 self.log("System", f"Audio listener error: {e}")
 
+    def _apply_dispatch_streak_state(self, is_internal_nudge: bool) -> None:
+        """dispatch 時の沈黙ストリーク状態を更新する（Fix-9a, テスト可能に分離）。
+
+        - 実ユーザターン (is_internal_nudge=False): ストリーク状態を全リセット。
+        - 内部 nudge (督促/期限超過 等, is_internal_nudge=True): idle 経路と同様に
+          nudge 自己記憶を引き継ぐ。この経路は _process_idle_input を通らないため、
+          ここで明示的にセットしないと回答ドリフト（猫→うさぎ）が起きる。
+        last_user_event_ts は読み出しゼロの dead フィールドのため書き込みを撤去済み。
+        """
+        now = time.time()
+        if not is_internal_nudge:
+            self._nudge_streak_count = 0
+            self._last_nudge_fire_ts = 0.0
+            self._nudge_spoken = []
+            if self.llm is not None:
+                self.llm.nudge_self_memory = []
+        else:
+            if self.llm is not None:
+                self.llm.nudge_self_memory = list(self._nudge_spoken)
+        self.state["idle_since_ts"] = now
+
     async def _dispatch_loop(self):
         """_pending_input_queue から取り出してマージ判断 + process_input を呼ぶ。
 
@@ -363,23 +384,8 @@ class TalkMode(BaseMode):
                         })
                         continue
 
-                now = time.time()
-                # A2: 実ユーザターンでのみ沈黙ストリーク状態をリセット（is_internal_nudge ラベルでガード）。
-                # 期限超過などの内部 nudge では reset しない（カテゴリ階段の early 巻き戻り防止）。
-                # last_user_event_ts は読み出しゼロの dead フィールドのため書き込みを撤去。
-                if not is_internal_nudge:
-                    self._nudge_streak_count = 0
-                    self._last_nudge_fire_ts = 0.0
-                    self._nudge_spoken = []
-                    if self.llm is not None:
-                        self.llm.nudge_self_memory = []
-                else:
-                    # Fix-9a: 督促(期限超過)など内部 nudge も idle 経路と同様に
-                    # 沈黙ストリークの自己記憶を見せ、回答ドリフト（猫→うさぎ）を防ぐ。
-                    # この経路は _process_idle_input を通らないため、ここで明示的にセットする。
-                    if self.llm is not None:
-                        self.llm.nudge_self_memory = list(self._nudge_spoken)
-                self.state["idle_since_ts"] = now
+                # Fix-9a / A2: 沈黙ストリーク状態を更新（内部 nudge は自己記憶を引き継ぐ）。
+                self._apply_dispatch_streak_state(is_internal_nudge)
 
                 # Step 4: マージ判断（_pending_lock 内で atomic に）
                 # Step 1.5 Fix A1: 期限超過 nudge ([内部: 期限超過 ...]) はマージ禁止、
