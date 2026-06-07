@@ -405,6 +405,9 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # A1: この沈黙ストリーク中に自分が既に言った nudge 発話の控え（TalkMode が毎 nudge 代入）。
         # 各要素 {"category": str, "text": str}。会話履歴/RAG には残さない ephemeral 表示専用。
         self.nudge_self_memory: list = []
+        # Fix-9b: 一貫性ストア — 既にコミットした自分の答え/嗜好（base_mode が process_input で代入）。
+        # 各要素 {"topic": str, "answer": str}。会話履歴/RAG には残さない ephemeral 表示専用。
+        self.committed_facts: list = []
         # Step 2: 一回限りの追加コンテキスト（中断マーカー等）。
         # _build_system_prompt で展開後に空文字でクリアされる。
         # vlm_context は process_input 内で毎ターン上書きされるため、別枠が必要。
@@ -650,6 +653,24 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 "（[check] が既にあれば出さない）。沈黙が深いほど「…」を選ぶ。\n\n"
             )
 
+        # Fix-9b: 一貫性ストア — 既にコミットした自分の答え/嗜好。理由なくぶれさせない（firm/ペルソナ持続）。
+        # base_mode が process_input で self.committed_facts を代入（idle / 督促 / 通常の全経路カバー）。
+        committed_facts_context = ""
+        _cf = getattr(self, "committed_facts", None)
+        if _cf:
+            _cf_lines = "\n".join(
+                f"  - 〈{c.get('topic', '?')} = {c.get('answer', '')}〉" for c in _cf[-6:]
+            )
+            committed_facts_context = (
+                "[一貫性・既にコミットした自分の答え（firm。理由なくぶれさせない）]:\n"
+                f"{_cf_lines}\n"
+                "  ※ 沈黙中や期限超過の催促でも同じ。前に答えた内容を勝手に別の答えにすり替えない"
+                "（猫と言ったのに後でうさぎ、は禁止）。\n"
+                "  ※ 変えてよいのは、自分が体験・強い理由で考えを改めたとき、または"
+                "ユーザーが明確な理由を示して変更を求めたときだけ。ただ尋ね直された／沈黙が続いた"
+                "だけでは変えない。表現は毎回少し変えてよいが、答えの中身は保つ。\n\n"
+            )
+
         # 直近5ターン (「…」は除外済み、生は base_mode 側でフィルタ)
         # Step 1.5: 各ターンに timestamp を表示し、AI1 がターン間隔から時間感覚を持てるようにする。
         # 直近 3 ターンのみ相対時間 (N秒前) を付ける（古いものは絶対時刻のみで字数節約）。
@@ -782,7 +803,7 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         combined = (
             ai2_context + goal_history_context
             + vlm_context_str + vlm_alerts_block + vision_hint
-            + rag_context + silence_context + nudge_memory_context + recent_context
+            + rag_context + silence_context + nudge_memory_context + committed_facts_context + recent_context
             + instruction_pending_block
             + goal_block
             + one_shot_block + now_block

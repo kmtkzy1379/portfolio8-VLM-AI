@@ -192,6 +192,53 @@ class BaseMode(ABC):
 
         self.log("System", "Shutdown complete")
 
+    # Fix-9b: コミット対象外の非実質発話（相槌・沈黙）。
+    _NONSUBSTANTIVE_FOR_COMMIT = frozenset(
+        {"…", "うん", "うん。", "はい", "あ", "あ。", "ん", "へえ", "そう", "うんうん", "あー", "あーね"}
+    )
+
+    def _maybe_commit_fact(self, input_text: str, ai_response: str, is_internal_nudge: bool) -> None:
+        """Fix-9b: Eve の実質回答を一貫性ストアに記録する（応答完了時, sync 入口）。
+
+        関連 instruction がある実質回答のみ対象。task_manager の command queue に enqueue するだけで、
+        conversation_cache / RAG には一切書かない（Fix-6 保全）。実際の defend/保存は
+        TaskManager._handle_commit_fact が行う（同じ話題に active な答えがあれば最初の答えを守る）。
+        """
+        if self.task_manager is None:
+            return
+        answer = (ai_response or "").strip()
+        if not answer or answer in self._NONSUBSTANTIVE_FOR_COMMIT:
+            return
+        import re as _re
+        instruction_text = ""
+        iid = None
+        m = _re.search(r"\[内部: 期限超過(?:再判定)?\s+(i_[0-9a-f]+)", input_text)
+        if m:
+            # 督促 nudge: instruction id が input_text に埋め込まれている
+            iid = m.group(1)
+            inst = self.task_manager.get_instruction(iid)
+            instruction_text = inst["instruction"] if inst else ""
+        else:
+            # idle / 通常ターン: 非終端 instruction が 1 件だけならそれに帰属（曖昧なら捕捉しない）
+            cands = self.task_manager.get_active_instructions_for_prompt()
+            if len(cands) != 1:
+                return
+            iid = cands[0]["id"]
+            instruction_text = cands[0]["instruction"]
+        if not instruction_text:
+            return
+        topic_norm = self.task_manager._normalize_instruction(instruction_text)
+        if not topic_norm:
+            return
+        self.task_manager.enqueue_command_nowait({
+            "kind": "commit_fact",
+            "scope": "eve",
+            "topic_norm": topic_norm,
+            "answer_text": answer[:120],
+            "instruction_id": iid,
+            "source": "nudge" if is_internal_nudge else "conversation",
+        })
+
     async def process_input(self, input_text: str, is_internal_nudge: bool = False) -> str:
         """
         テキスト入力を処理してAI応答を生成（外部 API は完全互換）。
@@ -309,6 +356,13 @@ class BaseMode(ABC):
                 count=5, exclude_ellipsis=True,
             )
             self.llm.recent_turns = recent_turns
+            # Fix-9b: 一貫性ストア（既にコミットした自分の答え/嗜好）を全経路で注入
+            # （idle / 督促 / 通常ターンは全てこの pipeline を通る）。
+            if self.task_manager is not None:
+                try:
+                    self.llm.committed_facts = self.task_manager.get_committed_facts_for_prompt()
+                except Exception:  # noqa: BLE001
+                    self.llm.committed_facts = []
             # 沈黙サマリ (「…」除外で失われた情報を別経路で AI1 に渡す)
             try:
                 self.llm.silence_summary = (
@@ -361,6 +415,13 @@ class BaseMode(ABC):
             # 応答をログに出力
             if ai_response:
                 self.log("AI", ai_response)
+                # Fix-9b: コミット事実の捕捉（応答完了時）。conversation_cache/RAG には書かない＝Fix-6 保全。
+                # 内部 nudge ターン（ドリフトが起きる場所）でも捕捉するが、 下の Fix-6 ガード本体には入らない。
+                if self.task_manager is not None:
+                    try:
+                        self._maybe_commit_fact(input_text, ai_response, is_internal_nudge)
+                    except Exception as e:  # noqa: BLE001
+                        self.log("System", f"[CommitFact] capture failed: {e}", level="debug")
                 # Step 3: 正常完了時のみ atomic に1ターン記録
                 # cancel 時はここに到達しないため user/ai どちらも記録されない
                 # Fix-6 P1-c (4) conversation_cache 汚染防止: 内部 nudge は履歴に書かない

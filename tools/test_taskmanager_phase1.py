@@ -203,6 +203,42 @@ async def test_committed_fact_recovery() -> None:
         await _teardown(tm2, path)
 
 
+async def test_capture_maybe_commit_fact() -> None:
+    print("\n--- Fix-9b: capture (_maybe_commit_fact) routes Eve's answer to the store ---")
+    from modes.talk_mode import TalkMode
+    mode = TalkMode()  # __init__ only -> no hardware
+    tm, path = await _make_tm()
+    mode.task_manager = tm
+    try:
+        now = datetime.now()
+        await _add_instruction(tm, "好きな動物を答える", iso(now + timedelta(seconds=30)))
+        iid = next(iter(tm._active_instructions.keys()))
+        topic = tm._normalize_instruction("好きな動物を答える")
+
+        # (a) idle/normal path: a single active candidate -> answer attributed to it.
+        mode._maybe_commit_fact("…", "猫だよ", is_internal_nudge=True)
+        await tm.flush_command_queue()
+        facts = tm.get_committed_facts_for_prompt()
+        check("idle capture stored 猫 under the instruction topic",
+              facts == [{"topic": topic, "answer": "猫だよ"}], f"facts={facts}")
+
+        # (b) overdue path: id embedded in input_text; a drift answer must be DEFENDED.
+        mode._maybe_commit_fact(f"[内部: 期限超過 {iid} を履行 — 好きな動物を答える]", "うさぎ",
+                                is_internal_nudge=True)
+        await tm.flush_command_queue()
+        facts = tm.get_committed_facts_for_prompt()
+        check("overdue drift defended via capture (still 猫)",
+              facts == [{"topic": topic, "answer": "猫だよ"}], f"facts={facts}")
+
+        # (c) a non-substantive answer ("うん") must NOT be captured.
+        mode._maybe_commit_fact("…", "うん", is_internal_nudge=True)
+        await tm.flush_command_queue()
+        n_active = len([f for f in tm._committed_facts.values() if f.status == "active"])
+        check("non-substantive answer not captured", n_active == 1, f"active={n_active}")
+    finally:
+        await _teardown(tm, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
@@ -210,6 +246,7 @@ async def main() -> None:
     await test_correct_timing()
     await test_committed_fact_defend()
     await test_committed_fact_recovery()
+    await test_capture_maybe_commit_fact()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
