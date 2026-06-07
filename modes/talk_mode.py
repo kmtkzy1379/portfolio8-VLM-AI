@@ -373,6 +373,12 @@ class TalkMode(BaseMode):
                     self._nudge_spoken = []
                     if self.llm is not None:
                         self.llm.nudge_self_memory = []
+                else:
+                    # Fix-9a: 督促(期限超過)など内部 nudge も idle 経路と同様に
+                    # 沈黙ストリークの自己記憶を見せ、回答ドリフト（猫→うさぎ）を防ぐ。
+                    # この経路は _process_idle_input を通らないため、ここで明示的にセットする。
+                    if self.llm is not None:
+                        self.llm.nudge_self_memory = list(self._nudge_spoken)
                 self.state["idle_since_ts"] = now
 
                 # Step 4: マージ判断（_pending_lock 内で atomic に）
