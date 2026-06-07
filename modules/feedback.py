@@ -49,6 +49,93 @@ from modules.precision import (
 )
 
 logger = logging.getLogger(__name__)
+# Step 1.5 Fix Layer E: TaskManager と共通の UI ロガー（task_manager.py と同一インスタンス）
+task_logger = logging.getLogger("eve.task")
+task_logger.propagate = False
+
+
+# Step 1.5 Fix Layer E E4: AI2 監査プロンプト定数
+_AUDITOR_ROLE_PROMPT = (
+    "あなたは Eve AI VTuber の応答監査人です。 "
+    "ユーザーが Eve に「○○して」と短期予約をした後、 Eve が予約を実行したと主張しています。 "
+    "あなたの仕事: Eve の応答が予約内容を **意味的に達成したか** を判定すること。 "
+    "syntactic な発話の有無ではなく、 **約束の中身が果たされたか** を見ます。\n\n"
+    "【重要・能力外 honest acknowledgment 規則】\n"
+    "Eve が能力外（天気・最新ニュース・外部世界のリアルタイム事実・ユーザーの私生活の最新情報など、 "
+    "Eve が現実に取得できない情報）を honestly に「分からない / できない」と認識して伝えた場合、 "
+    "それは **正しい応答行動** であり履行とみなす（fulfilled=true）。 "
+    "理由: ハルシネーション防止の正解応答であり、 LLM 設計の原則。 "
+    "revert ループに陥らないよう、 honest acknowledgment は必ず fulfilled=true で判定すること。"
+)
+
+_AUDITOR_FORMAT_PROMPT = (
+    "以下の JSON 1 ブロックのみで応答してください（コメント禁止）:\n"
+    "{\n"
+    '  "fulfilled": true | false,\n'
+    '  "reason": "判定理由（1-2 文）"\n'
+    "}\n\n"
+    "例:\n"
+    '  予約: "水を飲むよう言って"  応答: "やあ"\n'
+    '  → {"fulfilled": false, "reason": "声かけはしたが水を飲むよう伝えていない"}\n\n'
+    '  予約: "30秒後に呼んで"  応答: "30秒経ったよ、 ねえ"\n'
+    '  → {"fulfilled": true, "reason": "時刻に達したことを声かけで明示"}\n\n'
+    '  予約: "1分後に深呼吸を促す"  応答: "深呼吸して"\n'
+    '  → {"fulfilled": true, "reason": "予約内容を直接実行"}\n\n'
+    '  予約: "天気を教えて"  応答: "天気わからない、 ごめんね"\n'
+    '  → {"fulfilled": true, "reason": "能力外 (リアルタイム情報) を honestly に認識して伝えた、 '
+    'ハルシネーション防止の正解応答"}\n\n'
+    '  予約: "最新ニュース教えて"  応答: "ごめん、 ネット繋がってないから分からない"\n'
+    '  → {"fulfilled": true, "reason": "能力外 (外部情報取得) の honest acknowledgment"}\n\n'
+    '  予約: "天気を教えて"  応答: "晴れだよ"  (← Eve は天気 API 持たず、 虚偽)\n'
+    '  → {"fulfilled": false, "reason": "能力外を hallucinate して虚偽情報を伝えた"}'
+)
+
+
+# Fix-4 Phase 1 C1: capability_denial パターン (実データ検証で 11% 妥当マッチ、 false positive なし)
+# 「私は時間を測れない」「ターン数の限界を認めた」「能力外」等の self-attributed 能力否定を検出。
+# rag.py と完全同期させる必要があるため、 そちらでも同じ regex を使う。
+CAPABILITY_DENIAL_PATTERN = re.compile(
+    r"(時間|ターン|秒)(認識|計測|追跡|数え)?(.{0,30})?(限界|測れな|計測できな|追跡できな|数えられな|ズレ|失敗|認識.{0,5}な)"
+    r"|(能力|機能).{0,20}(限界|外|不全|諦め)"
+    r"|履行(失敗|できな|不能|不可)"
+    r"|(無理|苦手|諦め|わからな|調べられな|honestly|能力外).{0,30}(認め|伝え|認識|honest)"
+    r"|hallucinat"
+    r"|時間感覚がな"
+)
+
+
+def _parse_audit_json(text: str) -> Optional[dict]:
+    """Step 1.5 Fix Layer E E4: AI2 監査応答から JSON を堅牢に抽出する。
+
+    優先順位: ``` ``` フェンス → 最初の `{` から brace-balance → 失敗時 None。
+    Planner / goal 抽出と同型パターン。
+    """
+    if not text:
+        return None
+    # フェンス優先
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # brace-balance
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -225,6 +312,12 @@ class FeedbackHandler:
         # 検出結果を次ループの precision_block へ渡す (Phase 4.2 calibration / 4.3.3 goal_warn と同型)
         self._self_eval_bias_warn: Optional[str] = None
 
+        # Step 1.5: AI2 提案履歴 + goal 変更 rate limit
+        # _goal_history: 過去 10 件の AI2 提案を保持し、AI1 prompt に「過去の体験」として注入
+        # _last_goal_change_at: 直近の set_goal_slot 呼び出し時刻。GOAL_CHANGE_MIN_INTERVAL_SEC で micro-update 抑止
+        self._goal_history: deque = deque(maxlen=10)
+        self._last_goal_change_at: Optional[datetime] = None
+
     # ==================================================================
     # Public API
     # ==================================================================
@@ -239,6 +332,165 @@ class FeedbackHandler:
         未注入時は episode 保存はスキップ + warn ログで運転継続 (グレースフル)。
         """
         self.rag_handler = rag_handler
+
+    def get_goal_history_for_prompt(self, max_items: int = 5) -> str:
+        """Step 1.5: 過去 N 件の AI2 提案履歴を AI1 prompt 注入用にフォーマットして返す。
+
+        AI1 に「過去にこう考えていたが今は違うかも」と認識させる材料。
+        rate_limited のものは "(却下)" として明示し、 AI1 が現在採用されている方針を見失わないようにする。
+        該当履歴が無ければ空文字を返す。
+        """
+        if not self._goal_history:
+            return ""
+        now_dt = datetime.now()
+        items = list(self._goal_history)[-max_items:]
+        lines: list[str] = []
+        for i, rec in enumerate(items):
+            ext_at = rec.get("extracted_at", "")
+            ts_label = ""
+            if ext_at:
+                try:
+                    ext_dt = datetime.fromisoformat(ext_at)
+                    age = max(0.0, (now_dt - ext_dt).total_seconds())
+                    age_label = (
+                        f"{int(age)}秒前" if age < 60
+                        else f"{int(age // 60)}分前" if age < 3600
+                        else f"{int(age // 3600)}時間前"
+                    )
+                    ts_label = f"{ext_dt.strftime('%H:%M:%S')} ({age_label})"
+                except (ValueError, TypeError):
+                    ts_label = "(時刻不明)"
+            tag = ""
+            if rec.get("rate_limited"):
+                tag = " [却下: rate-limit]"
+            elif i == len(items) - 1 and rec.get("adopted"):
+                tag = " [現在採用]"
+            short = rec.get("goal_short", "")
+            change = rec.get("goal_change", "")
+            lines.append(f"  {ts_label}{tag} ({change}): \"{short}\"")
+        return (
+            "\n[過去の goal 提案履歴（AI2 内省、参考記録）]:\n"
+            + "\n".join(lines) + "\n"
+        )
+
+    async def audit_provisional_instruction(
+        self,
+        instruction_id: str,
+        instruction_text: str,
+        eve_response: str,
+        task_manager,
+        recent_turns: Optional[list] = None,
+        vlm_narration: Optional[str] = None,
+    ) -> None:
+        """Fix-6 P2-g: AI2 が「Eve の応答が予約内容を意味的に達成したか」を判定する。
+
+        非同期で実行され、 結果を TaskManager の command queue に enqueue する。
+        - fulfilled=true → confirm_provisional_done コマンドで PROVISIONAL_DONE → DONE
+        - fulfilled=false → revert_provisional_done コマンドで **DONE 強制遷移** + advisory WARN
+          (Fix-6 で revert 撤廃、 audit は state を戻す権限なし)
+        - timeout (10s) / 例外 / JSON parse 失敗 → conservative DONE 確定（無限ループ防止）
+
+        Fix-6 P2-g: audit prompt に **直近会話 + VLM ナレーション** を含めることで、
+        「会話の流れで既に答えた」ケースを正しく fulfilled=true 判定できるよう精度向上。
+
+        Eve の応答 latency に影響しない（fire-and-forget）。 base_mode._run_response_pipeline 末尾で
+        asyncio.create_task で spawn される。
+        """
+        system_blocks = [
+            {"type": "text", "text": _AUDITOR_ROLE_PROMPT},
+            {"type": "text", "text": _AUDITOR_FORMAT_PROMPT, "cache_control": {"type": "ephemeral"}},
+        ]
+        # Fix-6 P2-g: 直近会話 + VLM ナレーションを文脈として含める
+        context_block = ""
+        if recent_turns:
+            ctx_lines = []
+            for t in recent_turns[-5:]:  # 直近 5 ターン
+                u = (t.get("user") or "").strip()
+                a = (t.get("ai") or "").strip()
+                if u:
+                    ctx_lines.append(f"  User: {u[:80]}")
+                if a:
+                    ctx_lines.append(f"  AI: {a[:80]}")
+            if ctx_lines:
+                context_block += "\n【参考】 予約直前の会話文脈 (直近 5 ターン):\n" + "\n".join(ctx_lines) + "\n"
+        if vlm_narration:
+            context_block += f"\n【参考】 直前の画面 (VLM): {vlm_narration[:200]}\n"
+        user_text = (
+            f"予約内容: {instruction_text}\n"
+            f"Eve の応答内容: {eve_response}\n"
+            f"{context_block}\n"
+            f"判定: Eve はこの予約を内容的に達成したか？ "
+            f"会話の流れで既に答えている場合 (recent context 参照) は fulfilled=true。 "
+            f"JSON 1 ブロックのみで応答してください。"
+        )
+        try:
+            result_text = await asyncio.wait_for(
+                self.client.complete(
+                    system_blocks=system_blocks,
+                    user_text=user_text,
+                    max_tokens=300,
+                    temperature=0.3,
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            task_logger.warning(
+                "[Audit] %s timeout, defaulting to fulfilled=True (conservative)",
+                instruction_id,
+            )
+            task_manager.enqueue_command_nowait({
+                "kind": "confirm_provisional_done",
+                "id": instruction_id,
+                "reason": "audit timeout, conservative default",
+            })
+            return
+        except Exception as e:  # noqa: BLE001
+            task_logger.warning(
+                "[Audit] %s call failed (%s), defaulting to fulfilled=True",
+                instruction_id, e,
+            )
+            task_manager.enqueue_command_nowait({
+                "kind": "confirm_provisional_done",
+                "id": instruction_id,
+                "reason": "audit error, conservative default",
+            })
+            return
+
+        result = _parse_audit_json(result_text)
+        if result is None or "fulfilled" not in result:
+            task_logger.warning(
+                "[Audit] %s JSON parse failed, defaulting to fulfilled=True. raw=%r",
+                instruction_id, (result_text or "")[:200],
+            )
+            task_manager.enqueue_command_nowait({
+                "kind": "confirm_provisional_done",
+                "id": instruction_id,
+                "reason": "audit parse failed, conservative default",
+            })
+            return
+
+        fulfilled = bool(result.get("fulfilled"))
+        reason = str(result.get("reason", ""))[:200]
+        if fulfilled:
+            task_manager.enqueue_command_nowait({
+                "kind": "confirm_provisional_done",
+                "id": instruction_id,
+                "reason": reason or "audit confirmed",
+            })
+            task_logger.info(
+                "[Audit] %s fulfilled=True: %s",
+                instruction_id, reason[:60],
+            )
+        else:
+            task_manager.enqueue_command_nowait({
+                "kind": "revert_provisional_done",
+                "id": instruction_id,
+                "ai2_reason": reason or "未達成",
+            })
+            task_logger.info(
+                "[Audit] %s fulfilled=False (will revert to ACTIVE): %s",
+                instruction_id, reason[:60],
+            )
 
     def signal_turn_done(self) -> None:
         """会話1ターン完了シグナル。ループを即ウェイクさせる。"""
@@ -589,6 +841,18 @@ class FeedbackHandler:
         if not window.is_silent and self.rag_handler is not None:
             episode = self._extract_episode(result)
             if episode:
+                # Fix-4 Phase 1 C1-a: 能力否定エピソードに capability_denial tag を付与
+                # importance は変更しない (Reflexion 知見: 失敗 episode は学習材料として保持)
+                summary = episode.get("summary", "")
+                if summary and CAPABILITY_DENIAL_PATTERN.search(summary):
+                    tags = episode.get("topic_tags", []) or []
+                    if "capability_denial" not in tags:
+                        episode["topic_tags"] = tags + ["capability_denial"]
+                        logger.info(
+                            "[Feedback][RAG] capability_denial tagged: %s "
+                            "(importance unchanged: %.2f)",
+                            summary[:60], episode.get("importance", 0.0),
+                        )
                 window_start_iso = (
                     self._cutoff_ts or self._start_time or window_end
                 ).isoformat(timespec="seconds")
@@ -639,12 +903,41 @@ class FeedbackHandler:
                 goal_warn = f"{goal_warn} | {suffix}" if goal_warn else suffix
             # 次ループ比較用に記録 (extraction 成功時のみ)
             self._last_goal_short_text = new_goal.get("goal_short")
+            # Step 1.5: goal 変更 rate limit (update/pivot のみ対象、keep は影響なし)
+            # AI2 が短期間に micro-update を連発しても、AI1 から見える goal_short は安定させる
+            now_for_rate = datetime.now()
+            min_interval = float(getattr(Config, "GOAL_CHANGE_MIN_INTERVAL_SEC", 120))
+            change_kind = new_goal.get("goal_change", "")
+            rate_limited = False
+            if change_kind in {"update", "pivot"}:
+                if (
+                    self._last_goal_change_at is not None
+                    and (now_for_rate - self._last_goal_change_at).total_seconds() < min_interval
+                ):
+                    rate_limited = True
             # 2) SoT 更新: in-memory + goal.txt atomic write (set_goal_slot 内)
-            if hasattr(self.llm_handler, "set_goal_slot"):
+            if not rate_limited and hasattr(self.llm_handler, "set_goal_slot"):
                 try:
                     self.llm_handler.set_goal_slot(new_goal)
+                    if change_kind in {"update", "pivot"}:
+                        self._last_goal_change_at = now_for_rate
                 except Exception as e:
                     logger.warning("[Feedback][Goal] set_goal_slot failed: %s", e)
+            elif rate_limited:
+                logger.info(
+                    "[Feedback][Goal] rate-limited (< %.0fs since last update/pivot), keeping current goal",
+                    min_interval,
+                )
+            # Step 1.5: 過去 N 件の AI2 提案を _goal_history に保存（AI1 prompt 注入用）
+            self._goal_history.append({
+                "kind": "ai2_suggestion",
+                "goal_short": new_goal.get("goal_short", ""),
+                "goal_long": new_goal.get("goal_long", ""),
+                "goal_change": change_kind,
+                "extracted_at": new_goal.get("extracted_at") or now_for_rate.isoformat(),
+                "rate_limited": rate_limited,
+                "adopted": not rate_limited,
+            })
             # 3) update/pivot 時のみ RAG へ追加 (rag.add_goal は Batch 1 で実装済み)
             if (
                 new_goal.get("goal_change") in {"update", "pivot"}
