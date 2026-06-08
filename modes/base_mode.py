@@ -427,7 +427,16 @@ class BaseMode(ABC):
             # （idle / 督促 / 通常ターンは全てこの pipeline を通る）。
             if self.task_manager is not None:
                 try:
-                    self.llm.committed_facts = self.task_manager.get_committed_facts_for_prompt()
+                    # 関連性ゲート: 嗜好が増えても、いまの話題に関係する fact だけ注入して
+                    # プロンプトが無限に伸びないようにする（≤limit 件なら従来どおり全件）。
+                    # 関連シグナルは現ターンの入力 + 直近会話（fact は会話の話題に紐づくため）。
+                    _rel_parts = [input_text or ""]
+                    for _t in (recent_turns or []):
+                        _rel_parts.append(str(_t.get("user", "")))
+                        _rel_parts.append(str(_t.get("ai", "")))
+                    self.llm.committed_facts = self.task_manager.get_committed_facts_for_prompt(
+                        relevance_text=" ".join(_rel_parts)
+                    )
                 except Exception:  # noqa: BLE001
                     self.llm.committed_facts = []
             # 沈黙サマリ (「…」除外で失われた情報を別経路で AI1 に渡す)

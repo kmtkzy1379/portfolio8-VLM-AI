@@ -884,16 +884,55 @@ class TaskManager:
         for f in active[: len(active) - cap]:
             self._committed_facts.pop(f.fact_id, None)
 
-    def get_committed_facts_for_prompt(self, limit: int = 6) -> list[dict]:
+    @staticmethod
+    def _relevance_tokens(text: str) -> set:
+        """関連性判定用の軽量トークン化（依存なし・再現率重視）。
+        日本語/英数の連続(len>=2)を語として拾い、漢字は1文字も語として拾う。"""
+        text = (text or "").lower()
+        tokens = set()
+        # 日本語(ひらがな・カタカナ・漢字)/英数の連続(len>=2)を語として拾う。
+        for run in re.findall(r"[0-9a-z぀-ヿ一-鿿]{2,}", text):
+            tokens.add(run)
+        # 漢字は単体でも語になりやすいので1文字も拾う（再現率重視）。
+        for kanji in re.findall(r"[一-鿿]", text):
+            tokens.add(kanji)
+        return tokens
+
+    @classmethod
+    def _fact_is_relevant(cls, f, rel_tokens: set) -> bool:
+        """fact の topic/answer のトークンが relevance トークンと重なるか。"""
+        ftoks = cls._relevance_tokens(f.topic_norm) | cls._relevance_tokens(f.answer_text)
+        return bool(ftoks & rel_tokens)
+
+    def _committed_fact_to_prompt(self, f) -> dict:
+        return {"topic": f.topic_norm, "answer": f.answer_text,
+                "recent_expressions": list(f.recent_expressions)}
+
+    def get_committed_facts_for_prompt(
+        self, limit: int = 6, relevance_text: Optional[str] = None
+    ) -> list[dict]:
         """system prompt 注入用に active なコミット事実を返す（sync fast path）。
-        最新 limit 件、 {topic, answer} の配列。"""
+
+        relevance_text 無し or active が limit 以内 → 従来どおり最新 limit 件（byte-identical）。
+        relevance_text あり & active が limit 超 → 「いまの話題に関連する fact」+「最新 recent_floor 件」を
+        選んで最新 limit 件に絞る（嗜好が増えてもプロンプトが無限に伸びないようにする）。
+        recent_floor が「直近コミットした事実」を必ず残すので、トークン照合の取りこぼしでもドリフト防御は保たれる。
+        """
         active = [f for f in self._committed_facts.values() if f.status == "active"]
         active.sort(key=lambda f: f.committed_at)
-        return [
-            {"topic": f.topic_norm, "answer": f.answer_text,
-             "recent_expressions": list(f.recent_expressions)}
-            for f in active[-limit:]
-        ]
+
+        if not relevance_text or len(active) <= limit:
+            return [self._committed_fact_to_prompt(f) for f in active[-limit:]]
+
+        # gating path: limit を超える数の fact があり、関連文脈が与えられた時のみ。
+        recent_floor = 2  # 最新 2 件は無条件に残す（直近の嗜好を落とさない）。
+        rel_tokens = self._relevance_tokens(relevance_text)
+        keep_ids = {id(f) for f in active[-recent_floor:]}
+        for f in active:
+            if id(f) not in keep_ids and self._fact_is_relevant(f, rel_tokens):
+                keep_ids.add(id(f))
+        chosen = [f for f in active if id(f) in keep_ids]  # active 順(committed_at)を維持
+        return [self._committed_fact_to_prompt(f) for f in chosen[-limit:]]
 
     def _release_facts_for_instruction(self, iid: str, new_status: str) -> None:
         """instruction の終端遷移に伴い紐づく fact の status を更新。
