@@ -193,14 +193,38 @@ class TalkMode(BaseMode):
         """
         self.state["busy_llm"] = True
         try:
-            # ランダムなRAG記憶を取得
-            rag_memories = await self.rag.get_random_turns(count=2)
-            self.llm.rag_memories = rag_memories
-
+            # 直近ターンを先に取得（RAG クエリの材料に再利用する）。
             recent_turns = await self.conversation_cache.get_recent_turns(
                 count=5, exclude_ellipsis=True,
             )
             self.llm.recent_turns = recent_turns
+
+            # ① Proactivity: 沈黙時の RAG 材料は「ランダム」ではなく「いまの瞬間に関連する記憶」。
+            # クエリ = 最後の実ユーザ発話 + VLM シーン記述。cold-start / 失敗 / 空振りはランダムに退避。
+            # search_similar は embedding を叩く async なので timeout + fallback で idle ループを塞がない。
+            # （base_mode:420 の survival property で、この rag_memories は内部 nudge で [] 上書きされない）
+            rag_memories = []
+            try:
+                _q = []
+                if recent_turns:
+                    _lu = (recent_turns[-1].get("user") or "").strip()
+                    if _lu and _lu != "…":
+                        _q.append(_lu)
+                if self.vlm_bridge and self.vlm_bridge.is_running:
+                    _vd = (self.vlm_bridge.get_scene_description() or "").strip()
+                    if _vd:
+                        _q.append(_vd)
+                _query = " / ".join(_q)
+                if _query:
+                    _t = asyncio.create_task(self.rag.search_similar(_query))
+                    rag_memories = await asyncio.wait_for(_t, timeout=1.0)
+            except asyncio.TimeoutError:
+                self.log("System", "idle RAG search timeout - random fallback", level="debug")
+            except Exception as e:
+                self.log("System", f"idle RAG search failed: {e}", level="debug")
+            if not rag_memories:
+                rag_memories = await self.rag.get_random_turns(count=2)
+            self.llm.rag_memories = rag_memories
 
             # A2: カテゴリ判定クロックは silence_seconds（最後の「実」ユーザ発話起点。
             # 内部/期限超過 nudge では巻き戻らない信頼クロック。cold-start は 0.0 = early）。
