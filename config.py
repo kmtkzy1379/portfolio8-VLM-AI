@@ -94,6 +94,12 @@ class Config:
     FB_CALIBRATION_OVERCONF_THRESHOLD = float(os.getenv("FB_CALIBRATION_OVERCONF_THRESHOLD", "0.5"))
     # Affective Inference 出力 ON/OFF (実機で冗長過ぎなら false に)
     FB_AFFECT_OUTPUT_ENABLED = os.getenv("FB_AFFECT_OUTPUT_ENABLED", "true").lower() == "true"
+    # affect→tone（弱い口調ヒント）: AI2 が算出した感情を「古い可能性のある補助ヒント」として
+    # AI1 プロンプトに短く注入。TTL/信頼度ゲートで失効。現在文脈が最優先、矛盾なら無視。
+    # 履行(clear)・話す内容には一切影響させない（プロンプト文字列のみ）。
+    AFFECT_TONE_ENABLE = os.getenv("AFFECT_TONE_ENABLE", "true").lower() == "true"
+    AFFECT_TONE_TTL_SEC = int(os.getenv("AFFECT_TONE_TTL_SEC", "120"))
+    AFFECT_TONE_MIN_CONFIDENCE = float(os.getenv("AFFECT_TONE_MIN_CONFIDENCE", "0.4"))
     # precision_history.jsonl のパス (memory_summary 肥大化対策で分離)
     PRECISION_HISTORY_FILE = os.getenv("PRECISION_HISTORY_FILE", "precision_history.jsonl")
 

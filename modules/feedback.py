@@ -987,7 +987,9 @@ class FeedbackHandler:
         if not window.is_silent:
             self._prev_predictions = new_predictions
             self._prediction_hold_count = 0
-        self._inject_to_llm(result)
+        # new_affect は「このサイクルで新しく算出された」affect（沈黙時は None）。
+        # 弱い口調ヒント用にのみ AI1 へ渡す。履行・内容には影響させない。
+        self._inject_to_llm(result, new_affect=new_affect)
 
         # cutoff 更新
         self._cutoff_ts = window_end
@@ -2249,16 +2251,25 @@ class FeedbackHandler:
     # ------------------------------------------------------------------
     # Inject into response LLM
     # ------------------------------------------------------------------
-    def _inject_to_llm(self, feedback_text: str) -> None:
+    def _inject_to_llm(self, feedback_text: str, new_affect: Optional[dict] = None) -> None:
         """AI2 出力から「応答AIへの内省ノート」だけを抽出して AI1 に注入する。
 
         失敗時 (新セクション未出力) は feedback_text 先頭 600 字でフォールバック。
         これにより内部用語まみれの長文が AI1 のシステムプロンプトを支配することを防ぐ。
+
+        new_affect: このサイクルで「新しく算出された」affect のみ渡す。沈黙サイクルや
+        復元呼び出しでは None。これにより AI1 側で affect のタイムスタンプが再スタンプ
+        されず、age が伸びて TTL で失効する（古い気分が新鮮に見え続けるのを防ぐ）。
+        affect は弱い口調ヒント専用で、履行(clear)・話す内容には一切影響させない。
         """
         note = self._extract_ai1_note(feedback_text)
         payload = note if note else feedback_text[:600]
         if hasattr(self.llm_handler, "update_memory"):
             try:
-                self.llm_handler.update_memory(payload)
+                self.llm_handler.update_memory(
+                    payload,
+                    affect=new_affect,
+                    affect_set_at=datetime.now().isoformat() if new_affect else None,
+                )
             except Exception as e:
                 logger.warning("[Feedback] update_memory failed: %s", e)

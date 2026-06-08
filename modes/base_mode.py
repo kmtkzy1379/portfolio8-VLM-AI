@@ -101,11 +101,17 @@ class BaseMode(ABC):
         self.llm.history = [{"role": "system", "content": self.system_prompt}]
 
         # AI2フィードバック用のコールバック設定
-        def update_memory_func(memory_text):
+        def update_memory_func(memory_text, *, affect=None, affect_set_at=None):
             self.llm.ai2_feedback = memory_text[:Config.FB_LOOP_MAX_CHARS]
             # Step 1.5: 更新時刻も記録（古い参考情報ラベルの経過時間表示用）
             from datetime import datetime as _dt
             self.llm._ai2_feedback_set_at = _dt.now().isoformat()
+            # affect→tone (WEAK): 新しく算出された affect のみスタンプする。沈黙サイクルは
+            # affect=None で来るのでタイムスタンプを更新せず、age が伸びて TTL で失効する
+            # （古い気分が毎サイクル「新鮮」に再スタンプされて永遠に残るのを防ぐ）。
+            if affect is not None:
+                self.llm.affect = affect
+                self.llm._affect_set_at = affect_set_at or _dt.now().isoformat()
             self.log("System", f"AI2 Feedback Updated ({len(memory_text)} chars)", level="debug")
         self.llm.update_memory = update_memory_func
         self.llm.rag = self.rag

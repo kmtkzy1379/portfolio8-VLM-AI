@@ -398,6 +398,11 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # Step 1.5: AI2 ノートが最後に更新された時刻（ISO timestamp）。
         # 「過去の体験として記録」の経過時間表示に使う。base_mode の update_memory_func で更新。
         self._ai2_feedback_set_at: Optional[str] = None
+        # affect→tone（弱い口調ヒント・過去情報）。AI2 が算出した感情を short hint として
+        # 注入するための入れ物。{affect, intensity, valence} と更新時刻。TTL/信頼度ゲートで
+        # 失効。現在文脈が最優先で、矛盾なら無視。履行(clear)・話す内容には一切影響させない。
+        self.affect: Optional[dict] = None
+        self._affect_set_at: Optional[str] = None
         self.vlm_context = ""  # VLM画面認識コンテキスト
         # 沈黙サマリ (ConversationCache.get_silence_summary の戻り値)。
         # recent_turns から「…」を除外したため、その情報を別経路で AI1 に渡す。
@@ -801,6 +806,57 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         if getattr(self, "_suppress_pending_block", False):
             instruction_pending_block = ""
 
+        # affect→tone（弱い口調ヒント・過去情報）。AI2 が算出した感情を「古い可能性のある
+        # 補助ヒント」として短く注入する。TTL/信頼度ゲートで失効し、期限超過 active 時は
+        # 履行優先のため抑制。現在文脈が最優先で、矛盾なら無視。プロンプト文字列のみで、
+        # 履行(clear)・話す内容・予約には一切影響させない。
+        affect_tone_context = ""
+        _aff = getattr(self, "affect", None)
+        if (
+            getattr(Config, "AFFECT_TONE_ENABLE", False)
+            and isinstance(_aff, dict)
+            and getattr(self, "_affect_set_at", None)
+            and not instruction_active_block  # 期限超過 active 中は口調ヒントを出さない
+        ):
+            _age_sec = None
+            try:
+                _age_sec = (now_dt - datetime.fromisoformat(self._affect_set_at)).total_seconds()
+            except (ValueError, TypeError):
+                _age_sec = None
+            try:
+                _intensity = float(_aff.get("intensity") or 0.0)
+            except (ValueError, TypeError):
+                _intensity = 0.0
+            if (
+                _age_sec is not None
+                and 0.0 <= _age_sec <= Config.AFFECT_TONE_TTL_SEC
+                and 0.0 <= _intensity <= 1.0
+                and _intensity >= Config.AFFECT_TONE_MIN_CONFIDENCE
+            ):
+                _tone_words = {
+                    "curiosity": "探索的・問いかけ気味",
+                    "surprise": "驚き混じり・テンション高め",
+                    "calm": "落ち着いた",
+                    "concern": "気遣わしげ・控えめ",
+                    "vigilance": "慎重・一歩引いた",
+                    "relief": "ほっとした・やわらかい",
+                    "boredom": "気だるげ・あっさり",
+                    "confusion": "戸惑い気味・確認したげ",
+                }
+                _val_fallback = {"pos": "明るめ", "neu": "ふつう", "neg": "控えめ・落ち着いた"}
+                _label = str(_aff.get("affect") or "other")
+                _val = str(_aff.get("valence") or "neu")
+                _word = _tone_words.get(_label) or _val_fallback.get(_val, "ふつう")
+                _age_str = self._format_alert_age(max(0.0, _age_sec))
+                affect_tone_context = (
+                    f"\n[補助トーンヒント（{_age_str}の自己感情 {_label}/{_val}・確信{_intensity:.1f}・古い可能性あり）]:\n"
+                    f"  - 参考までに、いまは「{_word}」トーンに少しだけ寄っているかも。\n"
+                    "  ※ これは古い可能性のある弱い補助ヒント。現在のユーザー入力・直近会話・"
+                    "予約・沈黙サマリが最優先。少しでも矛盾するなら無視すること。\n"
+                    "  ※ トーンを少し寄せる程度の話で、話す内容・予約の履行・clear 判断には"
+                    "一切影響させない。\n\n"
+                )
+
         # 組み立て
         base_content = self.system_prompt
         if "# Start Conversation" in base_content:
@@ -812,7 +868,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         combined = (
             ai2_context + goal_history_context
             + vlm_context_str + vlm_alerts_block + vision_hint
-            + rag_context + silence_context + nudge_memory_context + committed_facts_context + recent_context
+            + rag_context + silence_context + nudge_memory_context + committed_facts_context
+            + affect_tone_context + recent_context
             + instruction_pending_block
             + goal_block
             + one_shot_block + now_block

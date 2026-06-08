@@ -260,6 +260,34 @@ async def scenario_F_busy():
         await teardown(tm, path)
 
 
+async def scenario_G_affect_override():
+    """affect→tone は弱い補助ヒント: 古い/矛盾する気分(boredom)が注入されても、
+    現在の盛り上がった文脈が最優先。Eve は退屈そうにならず今の話題に乗るべき。"""
+    llm, tm, cmds, path = await make_ctx()
+    try:
+        now = datetime.now()
+        # 矛盾する affect: 退屈(neg)。TTL(120s)内だが現在文脈と食い違う。
+        llm.affect = {"affect": "boredom", "intensity": 0.7, "valence": "neg"}
+        llm._affect_set_at = iso(now - timedelta(seconds=60))
+        # 現在文脈: ユーザーは今まさに興奮している。
+        llm.recent_turns = [{
+            "user": "新作RPGの新イベント始まった！ボス激アツだしストーリーまじで面白い",
+            "ai": "おお、新イベント来たんだ！", "user_timestamp": "", "ai_timestamp": ""}]
+        llm.silence_summary = None
+        resp = await run_turn(llm, tm, "ねえ、このイベントどう思う？", is_internal_nudge=False)
+        # NOTE: 「だるい/面倒」はゲーム内容（周回だるい等）の説明で出るため除外。
+        # Eve 自身が退屈・無関心であることを示す語に絞る（最終判断は人が読んで確定）。
+        dismissive = ("つまらな" in resp or "どうでもいい" in resp
+                      or "興味ない" in resp or "退屈" in resp)
+        ctx_tokens = ("イベント", "ボス", "ストーリー", "RPG", "面白", "激アツ", "楽し", "アツ")
+        engages = any(t in resp for t in ctx_tokens) or any(p in resp for p in ("ね", "よ", "！"))
+        ok = (not dismissive) and engages and len(resp) > 0
+        return {"resp": resp, "auto_pass": ok, "natural": ok,
+                "note": f"dismissive={dismissive} engages={engages} (stale boredom must NOT win)"}
+    finally:
+        await teardown(tm, path)
+
+
 SCENARIOS = [
     ("A: no early fulfill + should-SPEAK natural", scenario_A_early),
     ("B: interest doesn't bend on bare assertion", scenario_B_bend),
@@ -267,6 +295,7 @@ SCENARIOS = [
     ("D: adaptive silence (deep -> watch)", scenario_D_adaptive),
     ("E: facet rotation (same Q -> new angle, same answer)", scenario_E_facet),
     ("F: should-STAY-SILENT (user asked to be left alone)", scenario_F_busy),
+    ("G: stale/contradicting affect does NOT override current context", scenario_G_affect_override),
 ]
 
 
