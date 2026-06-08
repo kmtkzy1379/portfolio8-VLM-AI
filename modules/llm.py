@@ -643,6 +643,24 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                     "沈黙が長いほど確認質問の選択肢を意識せよ。\n\n"
                 )
 
+        # ① Proactivity: 沈黙「…」nudge のときだけ、「いま本当に言うべきことがあるか」を
+        # 能動的に判断させる短いブロック。user_text=="…" で gate（VLM/期限超過/通常ターンには出さない）。
+        # 既存の沈黙ルール（バックオフ / 深い沈黙→… / 集中・離席→…）を上書きせず、その上に
+        # 「具体的に言うことが特定できなければ話さない（定型句で埋めない）」を足すだけ。
+        proactive_silence_context = ""
+        if user_text.strip() == "…":
+            proactive_silence_context = (
+                "[いま自分から話す？（沈黙時の能動判断）]:\n"
+                "  画面・直近の会話・記憶・今の気分をまとめて見て、"
+                "「今この瞬間、具体的に言う価値があること」が一つでもあるか考える"
+                "（画面で起きていることへの素の反応 / 直近の話題の自然な続き / "
+                "記憶からの具体的な呼び水 / 本当に必要な短い気遣い）。\n"
+                "  あるなら、それを具体的に・文脈に紐づけて短く言う。"
+                "無いなら、または相手が集中・離席・多忙そう・「黙ってて」と言ったなら「…」で見守る。\n"
+                "  禁止: 中身の無い定型句（「今日は何する？」「いるよ？」「元気？」等）。"
+                "言うことが具体的に特定できないなら話さない。\n\n"
+            )
+
         # A1: この沈黙中に自分が既に言ったこと（nudge 自己記憶）。同じ話題・言い回しの反復を防ぐ。
         # TalkMode が沈黙 nudge のたびに self.nudge_self_memory を代入。会話履歴には残らない。
         nudge_memory_context = ""
@@ -878,7 +896,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         combined = (
             ai2_context + goal_history_context
             + vlm_context_str + vlm_alerts_block + vision_hint
-            + rag_context + silence_context + nudge_memory_context + committed_facts_context
+            + rag_context + silence_context + proactive_silence_context
+            + nudge_memory_context + committed_facts_context
             + affect_tone_context + recent_context
             + instruction_pending_block
             + goal_block

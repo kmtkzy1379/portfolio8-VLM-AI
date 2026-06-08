@@ -123,8 +123,36 @@ async def test_fix8_gate() -> None:
             pass
 
 
+def test_proactive_block() -> None:
+    print("\n--- ① Proactivity: 能動判断ブロックは沈黙『…』時のみ（gate） ---")
+    llm = LLMHandler()
+    llm.system_prompt = "テスト用システムプロンプト"
+    llm.recent_turns = []
+    llm.silence_summary = None
+    llm.committed_facts = []
+    llm.nudge_self_memory = []
+    llm.rag_memories = []
+    llm.vlm_context = ""
+    llm.one_shot_context = ""
+    llm._task_manager = None
+    MARK = "沈黙時の能動判断"
+    p_silence = llm._build_system_prompt("…")
+    check("proactive block present on silence '…'", MARK in p_silence)
+    check("bans generic filler (今日は何する？/定型句)",
+          "今日は何する？" in p_silence and "定型句" in p_silence)
+    check("defers to busy/away/'黙ってて' -> 見守る",
+          "黙ってて" in p_silence and "見守る" in p_silence)
+    # Gate: must NOT appear on real user turns / VLM nudges / overdue nudges.
+    check("absent on real user turn", MARK not in llm._build_system_prompt("好きな動物おしえて"))
+    check("absent on VLM nudge",
+          MARK not in llm._build_system_prompt("[内部: 画面に新しい変化があった - 自然にリアクションして]"))
+    check("absent on overdue nudge",
+          MARK not in llm._build_system_prompt("[内部: 期限超過 i_abc を履行 — 好きな動物を答える]"))
+
+
 async def _amain() -> None:
     run()
+    test_proactive_block()
     await test_fix8_gate()
 
 
