@@ -89,6 +89,31 @@ async def run_turn(llm, tm, text, is_internal_nudge=False) -> str:
     return resp.strip()
 
 
+def _detect_duplication(text: str) -> bool:
+    """X+X 暴走の検出（dedup guard と同じ判定、トリムはせず bool を返す）。
+    Tier-2 は generate_stream を直接叩くため dedup guard(_run_response_pipeline) は通らない=生の重複率を測れる。"""
+    t = (text or "").strip()
+    if len(t) < 30:
+        return False
+    mid = len(t) // 2
+    span = max(8, len(t) // 5)
+    best = None
+    for d in range(0, span):
+        for j in (mid - d, mid + d):
+            if 0 < j < len(t) and t[j - 1] in "。！？!?":
+                best = j
+                break
+        if best is not None:
+            break
+    if best is None:
+        return False
+    a, b = t[:best].strip(), t[best:].strip()
+    if a and b and len(a) >= 12:
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, a, b).ratio() >= 0.95
+    return False
+
+
 def cleared_done(cmds) -> bool:
     return any(c.get("kind") == "clear_active_instruction" and c.get("status") == "done" for c in cmds)
 
@@ -249,8 +274,13 @@ async def main(n: int):
     if not (Config.GROQ_API_KEY and Config.OPENAI_API_KEY):
         print("Tier-2 needs GROQ/OPENAI keys in .env — aborting.")
         sys.exit(2)
-    print(f"Tier-2: {n} runs per scenario, model AI1={getattr(Config, 'AI1_MODEL', '?')}\n")
+    print(f"Tier-2: {n} runs per scenario, model AI1={getattr(Config, 'AI1_MODEL', '?')}")
+    print(f"  temp={Config.AI1_TEMPERATURE} top_p={Config.AI1_TOP_P} "
+          f"freq_pen={getattr(Config, 'AI1_FREQUENCY_PENALTY', 0.0)} "
+          f"pres_pen={getattr(Config, 'AI1_PRESENCE_PENALTY', 0.0)}\n")
     summary = {}
+    dup_total = 0
+    run_total = 0
     for label, fn in SCENARIOS:
         print(f"================ {label} ================")
         passes = 0
@@ -262,6 +292,9 @@ async def main(n: int):
             except Exception as e:  # noqa: BLE001
                 print(f"  run {r}: ERROR {type(e).__name__}: {e}")
                 continue
+            run_total += 1
+            if _detect_duplication(res["resp"]):
+                dup_total += 1
             ok = res["auto_pass"]
             passes += 1 if ok else 0
             if "natural" in res:
@@ -279,6 +312,8 @@ async def main(n: int):
         p, t = vals[0], vals[1]
         extra = f" | naturalness {vals[2]}/{vals[3]}" if vals[3] else ""
         print(f"  {label}: {p}/{t}{extra}")
+    print(f"\n  RUNAWAY DUPLICATION (X+X, raw): {dup_total}/{run_total} "
+          f"({100 * dup_total / max(1, run_total):.1f}%)")
 
 
 if __name__ == "__main__":

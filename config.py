@@ -21,11 +21,14 @@ class Config:
     # Models
     AI1_MODEL = os.getenv("AI1_MODEL_NAME", "llama-3.3-70b-versatile")
     # ① Diversity: AI1 サンプリング（多様な応答のため。従来 0.7 固定から引き上げ）
-    AI1_TEMPERATURE = float(os.getenv("AI1_TEMPERATURE", "0.85"))
+    # A/B (Tier-2 8run×6scenario) で temp 0.85 vs 0.6+penalty は品質・自然さ同等・重複0/48。
+    # 信頼性優先で低リスク側を既定に: temp は研究推奨の chat レンジ中庸、反復は penalty で抑える。
+    # 多様性は facet rotation + プロンプトが担うため raw temp を上げる必要はない。全て env で調整可。
+    AI1_TEMPERATURE = float(os.getenv("AI1_TEMPERATURE", "0.7"))
     AI1_TOP_P = float(os.getenv("AI1_TOP_P", "0.9"))
-    # 反復抑制（OpenAI は反映、Groq は受理するが無視。既定 0 = 従来挙動）
-    AI1_FREQUENCY_PENALTY = float(os.getenv("AI1_FREQUENCY_PENALTY", "0.0"))
-    AI1_PRESENCE_PENALTY = float(os.getenv("AI1_PRESENCE_PENALTY", "0.0"))
+    # 反復抑制（OpenAI は反映、Groq は受理するが無視）
+    AI1_FREQUENCY_PENALTY = float(os.getenv("AI1_FREQUENCY_PENALTY", "0.3"))
+    AI1_PRESENCE_PENALTY = float(os.getenv("AI1_PRESENCE_PENALTY", "0.3"))
     AI2_MODEL = os.getenv("AI2_MODEL_NAME", "claude-opus-4-5")
     AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-4o")
     AI2_MAX_TOKENS = int(os.getenv("AI2_MAX_TOKENS", "4000"))
