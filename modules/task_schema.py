@@ -187,12 +187,14 @@ class CommittedFact:
     """
     fact_id: str
     topic_norm: str               # _normalize_instruction(instruction) でキー化
-    answer_text: str              # 最初にコミットした回答（verbatim, cap 済み）
+    answer_text: str              # 最初にコミットした回答（= 守る中身。verbatim, cap 済み）
     scope: str = "eve"            # "eve" | "user"
     instruction_id: Optional[str] = None
     committed_at: str = ""
     source: str = "nudge"         # "nudge" | "idle" | "conversation"
     status: str = "active"        # "active" | "released" | "superseded"
+    # ① Facet rotation: 同じ話題で使った言い回しの履歴（中身は変えず、表現を毎回変えるため）。
+    recent_expressions: list = field(default_factory=list)
 
     def to_jsonable(self) -> dict:
         return asdict(self)
@@ -208,4 +210,5 @@ class CommittedFact:
             committed_at=d.get("committed_at", ""),
             source=d.get("source", "nudge"),
             status=d.get("status", "active"),
+            recent_expressions=list(d.get("recent_expressions", [])),
         )

@@ -398,6 +398,11 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         # Step 1.5: AI2 ノートが最後に更新された時刻（ISO timestamp）。
         # 「過去の体験として記録」の経過時間表示に使う。base_mode の update_memory_func で更新。
         self._ai2_feedback_set_at: Optional[str] = None
+        # affect→tone（弱い口調ヒント・過去情報）。AI2 が算出した感情を short hint として
+        # 注入するための入れ物。{affect, intensity, valence} と更新時刻。TTL/信頼度ゲートで
+        # 失効。現在文脈が最優先で、矛盾なら無視。履行(clear)・話す内容には一切影響させない。
+        self.affect: Optional[dict] = None
+        self._affect_set_at: Optional[str] = None
         self.vlm_context = ""  # VLM画面認識コンテキスト
         # 沈黙サマリ (ConversationCache.get_silence_summary の戻り値)。
         # recent_turns から「…」を除外したため、その情報を別経路で AI1 に渡す。
@@ -658,18 +663,33 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         committed_facts_context = ""
         _cf = getattr(self, "committed_facts", None)
         if _cf:
-            _cf_lines = "\n".join(
-                f"  - 〈{c.get('topic', '?')} = {c.get('answer', '')}〉" for c in _cf[-6:]
-            )
+            _cf_lines = []
+            for c in _cf[-6:]:
+                _ans = c.get("answer", "")
+                _line = f"  - 〈{c.get('topic', '?')} = {_ans}〉"
+                # answer 自身も「既に使った言い方」なので avoid-list に含める（重複除去）。
+                # headline と avoid を矛盾なく揃え、headline 丸写しを防ぐ。
+                _avoid = []
+                for e in [_ans, *(c.get("recent_expressions") or [])]:
+                    if e and e not in _avoid:
+                        _avoid.append(e)
+                if _avoid:
+                    _line += "（既に使った言い方＝そのまま言わない: " + " / ".join(f"「{e}」" for e in _avoid[-4:]) + "）"
+                _cf_lines.append(_line)
+            _cf_block = "\n".join(_cf_lines)
             committed_facts_context = (
-                "[一貫性: 中身(substance)は firm、表現(expression)は毎回多様に]:\n"
-                f"{_cf_lines}\n"
-                "  【中身は守る】前に答えた内容を別の答えにすり替えない（猫と言ったのに後でうさぎ、は禁止）。"
-                "沈黙中や期限超過の催促でも同じ。変えてよいのは自分が体験・強い理由で考えを改めたとき、"
-                "またはユーザーが明確な理由を示したときだけ。尋ね直された／沈黙が続いただけでは変えない。\n"
-                "  【表現は毎回変える】同じ答えでも、言い回し・感情・詳細度・切り口を毎ターン意識して変える。"
-                "同じ言い方を繰り返さない。たとえば「猫」でも: 「猫だよ、強い」/「…猫。やっぱり猫」/"
-                "「猫かな。あの気まぐれが好き」/「猫ですね、なんか惹かれる」のように毎回ちがう顔で。\n\n"
+                "[一貫性: 中身も理由も firm、言い回しだけ毎回変える]:\n"
+                f"{_cf_block}\n"
+                "  【中身も理由も守る】〈〉内は“守るべき中身”の記録であって、読み上げる台本ではない。"
+                "前に答えた中身を別の答えにすり替えない（猫→うさぎは禁止）。"
+                "好きな理由も毎回でっち上げず一貫させる（人は同じ理由でずっと好きなのが自然。"
+                "理由をコロコロ変える方が不自然）。沈黙中や期限超過の催促でも同じ。変えてよいのは自分が"
+                "体験・強い理由で考えを改めたとき、またはユーザーが明確な理由を示したときだけ。"
+                "尋ね直された／沈黙が続いただけでは変えない。\n"
+                "  【同じ言い回しは繰り返さない】狙いは“全く同じ発話をしない”こと。"
+                "「既に使った言い方」は一字一句そのまま言わない（短い定型ほど無意識に繰り返しがちなので注意）。"
+                "新しい理由を作るのではなく、いまの文脈に絡めて言い直す——直近の会話・画面で起きていること・"
+                "今の気分・記憶に触れて自然に。\n\n"
             )
 
         # 直近5ターン (「…」は除外済み、生は base_mode 側でフィルタ)
@@ -796,6 +816,57 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         if getattr(self, "_suppress_pending_block", False):
             instruction_pending_block = ""
 
+        # affect→tone（弱い口調ヒント・過去情報）。AI2 が算出した感情を「古い可能性のある
+        # 補助ヒント」として短く注入する。TTL/信頼度ゲートで失効し、期限超過 active 時は
+        # 履行優先のため抑制。現在文脈が最優先で、矛盾なら無視。プロンプト文字列のみで、
+        # 履行(clear)・話す内容・予約には一切影響させない。
+        affect_tone_context = ""
+        _aff = getattr(self, "affect", None)
+        if (
+            getattr(Config, "AFFECT_TONE_ENABLE", False)
+            and isinstance(_aff, dict)
+            and getattr(self, "_affect_set_at", None)
+            and not instruction_active_block  # 期限超過 active 中は口調ヒントを出さない
+        ):
+            _age_sec = None
+            try:
+                _age_sec = (now_dt - datetime.fromisoformat(self._affect_set_at)).total_seconds()
+            except (ValueError, TypeError):
+                _age_sec = None
+            try:
+                _intensity = float(_aff.get("intensity") or 0.0)
+            except (ValueError, TypeError):
+                _intensity = 0.0
+            if (
+                _age_sec is not None
+                and 0.0 <= _age_sec <= Config.AFFECT_TONE_TTL_SEC
+                and 0.0 <= _intensity <= 1.0
+                and _intensity >= Config.AFFECT_TONE_MIN_CONFIDENCE
+            ):
+                _tone_words = {
+                    "curiosity": "探索的・問いかけ気味",
+                    "surprise": "驚き混じり・テンション高め",
+                    "calm": "落ち着いた",
+                    "concern": "気遣わしげ・控えめ",
+                    "vigilance": "慎重・一歩引いた",
+                    "relief": "ほっとした・やわらかい",
+                    "boredom": "気だるげ・あっさり",
+                    "confusion": "戸惑い気味・確認したげ",
+                }
+                _val_fallback = {"pos": "明るめ", "neu": "ふつう", "neg": "控えめ・落ち着いた"}
+                _label = str(_aff.get("affect") or "other")
+                _val = str(_aff.get("valence") or "neu")
+                _word = _tone_words.get(_label) or _val_fallback.get(_val, "ふつう")
+                _age_str = self._format_alert_age(max(0.0, _age_sec))
+                affect_tone_context = (
+                    f"\n[補助トーンヒント（{_age_str}の自己感情 {_label}/{_val}・確信{_intensity:.1f}・古い可能性あり）]:\n"
+                    f"  - 参考までに、いまは「{_word}」トーンに少しだけ寄っているかも。\n"
+                    "  ※ これは古い可能性のある弱い補助ヒント。現在のユーザー入力・直近会話・"
+                    "予約・沈黙サマリが最優先。少しでも矛盾するなら無視すること。\n"
+                    "  ※ トーンを少し寄せる程度の話で、話す内容・予約の履行・clear 判断には"
+                    "一切影響させない。\n\n"
+                )
+
         # 組み立て
         base_content = self.system_prompt
         if "# Start Conversation" in base_content:
@@ -807,7 +878,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         combined = (
             ai2_context + goal_history_context
             + vlm_context_str + vlm_alerts_block + vision_hint
-            + rag_context + silence_context + nudge_memory_context + committed_facts_context + recent_context
+            + rag_context + silence_context + nudge_memory_context + committed_facts_context
+            + affect_tone_context + recent_context
             + instruction_pending_block
             + goal_block
             + one_shot_block + now_block
@@ -1200,7 +1272,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 messages=self.history,
                 tools=tools_for_call,
                 tool_choice="auto",
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1210,7 +1285,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 messages=self.history,
                 tools=tools_for_call,
                 tool_choice="auto",
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 max_tokens=self._fallback_max_tokens,
             )
 
@@ -1348,7 +1426,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 model=self.model,
                 messages=self.history,
                 stream=True,
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1357,7 +1438,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 model=self._fallback_model,
                 messages=self.history,
                 stream=True,
-                temperature=0.7,
+                temperature=Config.AI1_TEMPERATURE,
+                top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 max_tokens=self._fallback_max_tokens,
             )
 

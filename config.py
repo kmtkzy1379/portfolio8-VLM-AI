@@ -20,6 +20,15 @@ class Config:
 
     # Models
     AI1_MODEL = os.getenv("AI1_MODEL_NAME", "llama-3.3-70b-versatile")
+    # ① Diversity: AI1 サンプリング（多様な応答のため。従来 0.7 固定から引き上げ）
+    # A/B (Tier-2 8run×6scenario) で temp 0.85 vs 0.6+penalty は品質・自然さ同等・重複0/48。
+    # 信頼性優先で低リスク側を既定に: temp は研究推奨の chat レンジ中庸、反復は penalty で抑える。
+    # 多様性は facet rotation + プロンプトが担うため raw temp を上げる必要はない。全て env で調整可。
+    AI1_TEMPERATURE = float(os.getenv("AI1_TEMPERATURE", "0.7"))
+    AI1_TOP_P = float(os.getenv("AI1_TOP_P", "0.9"))
+    # 反復抑制（OpenAI は反映、Groq は受理するが無視）
+    AI1_FREQUENCY_PENALTY = float(os.getenv("AI1_FREQUENCY_PENALTY", "0.3"))
+    AI1_PRESENCE_PENALTY = float(os.getenv("AI1_PRESENCE_PENALTY", "0.3"))
     AI2_MODEL = os.getenv("AI2_MODEL_NAME", "claude-opus-4-5")
     AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-4o")
     AI2_MAX_TOKENS = int(os.getenv("AI2_MAX_TOKENS", "4000"))
@@ -85,6 +94,12 @@ class Config:
     FB_CALIBRATION_OVERCONF_THRESHOLD = float(os.getenv("FB_CALIBRATION_OVERCONF_THRESHOLD", "0.5"))
     # Affective Inference 出力 ON/OFF (実機で冗長過ぎなら false に)
     FB_AFFECT_OUTPUT_ENABLED = os.getenv("FB_AFFECT_OUTPUT_ENABLED", "true").lower() == "true"
+    # affect→tone（弱い口調ヒント）: AI2 が算出した感情を「古い可能性のある補助ヒント」として
+    # AI1 プロンプトに短く注入。TTL/信頼度ゲートで失効。現在文脈が最優先、矛盾なら無視。
+    # 履行(clear)・話す内容には一切影響させない（プロンプト文字列のみ）。
+    AFFECT_TONE_ENABLE = os.getenv("AFFECT_TONE_ENABLE", "true").lower() == "true"
+    AFFECT_TONE_TTL_SEC = int(os.getenv("AFFECT_TONE_TTL_SEC", "120"))
+    AFFECT_TONE_MIN_CONFIDENCE = float(os.getenv("AFFECT_TONE_MIN_CONFIDENCE", "0.4"))
     # precision_history.jsonl のパス (memory_summary 肥大化対策で分離)
     PRECISION_HISTORY_FILE = os.getenv("PRECISION_HISTORY_FILE", "precision_history.jsonl")
 

@@ -12,7 +12,7 @@ Eve AI VTuber + VLM 統合システム。マイク・YouTube ライブチャッ�
 - Runtime: Python 3.13
 - Framework: Tkinter (UI), asyncio (モード処理), threading (VLM パイプライン)
 - Database: なし。永続化は JSONL / TXT のフラットファイル（リポジトリ root に保存）
-- Testing: 自動テストは未整備。UI 上で手動確認
+- Testing: Phase 1 で `tools/` にテストハーネスを整備（下記「テスト方法」）。Tier-1（API不要・決定論）+ Tier-2（実LLM・ヘッドレス）。UI 上の手動確認も併用
 - Linter/Formatter: 設定なし
 - Package Manager: pip + `requirements.txt`
 
@@ -23,7 +23,9 @@ Eve AI VTuber + VLM 統合システム。マイク・YouTube ライブチャッ�
 - Install: `python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt`
 - Run (full auto): `python run.py` — VTube Studio + VOICEVOX を自動起動 → `vts.py` を別プロセス起動 → `app.py` を呼ぶ
 - Run (UI only): `python app.py` — 外部アプリは起動済みの前提
-- Build / Test / Typecheck / Lint / Format: 設定なし
+- Test (Tier-1, API不要): `$env:PYTHONIOENCODING="utf-8"; venv\Scripts\python.exe tools\test_*_phase1.py`（各ファイルが PASS/FAIL と合計を表示）
+- Test (Tier-2, 実LLM): `venv\Scripts\python.exe tools\tier2_phase1.py <N>`（N回×シナリオ。要 `.env` キー・コスト発生）
+- Build / Typecheck / Lint / Format: 設定なし
 
 ## Project Structure
 
@@ -79,6 +81,18 @@ grep / Glob のヒットがこの配下なら **編集対象から除外**:
 - フォーマットやlintは、手作業ではなく既存のツール設定に従う。
 - セキュリティ上重要な変更、破壊的変更、DBマイグレーション、外部API仕様変更は事前に確認する。
 - README.md と現状コードが食い違う場合は **コードを正とする**。
+
+## テスト方法（Phase 1 で整備）
+
+`tools/` にヘッドレステストハーネスがある。実行時は `$env:PYTHONIOENCODING="utf-8"` を付ける（Windows コンソールの日本語文字化け回避）。
+
+- **Tier-1（API不要・決定論・速い）**: 配線とロジックを検証。実 `TaskManager` を一時 `tasks.jsonl` に対して動かし、ハードウェア層（AudioInput/STT/AudioPlayer/TTS/RAG/Feedback）は軽量スタブにする。`TalkMode()` は `initialize()` を呼ばずに構築すれば mic/LLM/音声を作らない（`__init__` だけ）。`process_input(...)` や `generate_stream` を直接駆動する。代表: `test_taskmanager_phase1.py`（instruction ライフサイクル・committed-fact）/ `test_safety_net_phase1.py`（スタブ LLM + 実 TaskManager）/ `test_dedup_guard_phase1.py`（純関数）/ `test_llm_injection_phase1.py`（`_build_system_prompt` のブロック描画）/ `test_e2e_idle_phase1.py`（idle 経路 E2E）。
+  - 時間の進め方: deadline は **未来で登録**してから（B2 クランプが過去日付を null 化するため）`inst.deadline_at` を直接過去にして `await tm._reconcile_instruction_status()` を呼ぶと ACTIVE 化できる。
+- **Tier-2（実LLM・ヘッドレス）**: `tier2_phase1.py N` が実 `LLMHandler` を本番同等の文脈（talk_prompt + 実 TaskManager の instruction ブロック + committed_facts + silence_summary + meta-tools）で叩き、各シナリオを N 回回して合格率・文脈的自然さ・重複率を出す。要 `.env` キー（コスト発生）。サンプリングは `AI1_TEMPERATURE` 等の env で切替えて A/B できる。
+
+## マルチエージェント運用（重要）
+
+非自明な調査・設計・レビューは 3〜5 個の Explore/Plan サブエージェントを別観点で並列起動して進める（例: 根因調査 / 設計 / Web 調査 / レッドチーム / テスト設計）。**エージェントの結論は鵜呑みにしない** — 実在する重複バグをあるエージェントが「否定」したが、一次データ（ログの直接 grep）で覆った事例がある。重要な主張は必ず一次ソース（実ログ行・実コード行）で自分で確認する。実装は小さな増分でコミットし、各段で Tier-1（可能なら Tier-2）を回してから次へ進む。
 
 ## Update Policy
 

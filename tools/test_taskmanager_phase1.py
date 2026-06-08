@@ -157,13 +157,15 @@ async def test_committed_fact_defend() -> None:
     try:
         await _commit_fact(tm, "好きな動物", "猫だよ", iid="i_x")
         facts = tm.get_committed_facts_for_prompt()
-        check("first commit stored", facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+        check("first commit stored",
+              len(facts) == 1 and facts[0]["topic"] == "好きな動物" and facts[0]["answer"] == "猫だよ",
+              f"facts={facts}")
 
-        # Drift attempt: same topic, different answer -> must be DEFENDED (not overwritten).
+        # Drift attempt: same topic, different answer -> substance must be DEFENDED.
         await _commit_fact(tm, "好きな動物", "うさぎ", iid="i_x")
         facts = tm.get_committed_facts_for_prompt()
-        check("drift defended: still 猫だよ (not うさぎ)",
-              facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+        check("drift defended: substance still 猫だよ (not うさぎ)",
+              len(facts) == 1 and facts[0]["answer"] == "猫だよ", f"facts={facts}")
         n_active = len([f for f in tm._committed_facts.values() if f.status == "active"])
         check("no duplicate fact created", n_active == 1, f"active={n_active}")
 
@@ -198,7 +200,8 @@ async def test_committed_fact_recovery() -> None:
     try:
         facts = tm2.get_committed_facts_for_prompt()
         check("fact restored after restart",
-              facts == [{"topic": "好きな動物", "answer": "猫だよ"}], f"facts={facts}")
+              len(facts) == 1 and facts[0]["topic"] == "好きな動物" and facts[0]["answer"] == "猫だよ",
+              f"facts={facts}")
     finally:
         await _teardown(tm2, path)
 
@@ -220,7 +223,8 @@ async def test_capture_maybe_commit_fact() -> None:
         await tm.flush_command_queue()
         facts = tm.get_committed_facts_for_prompt()
         check("idle capture stored 猫 under the instruction topic",
-              facts == [{"topic": topic, "answer": "猫だよ"}], f"facts={facts}")
+              len(facts) == 1 and facts[0]["topic"] == topic and facts[0]["answer"] == "猫だよ",
+              f"facts={facts}")
 
         # (b) overdue path: id embedded in input_text; a drift answer must be DEFENDED.
         mode._maybe_commit_fact(f"[内部: 期限超過 {iid} を履行 — 好きな動物を答える]", "うさぎ",
@@ -228,7 +232,7 @@ async def test_capture_maybe_commit_fact() -> None:
         await tm.flush_command_queue()
         facts = tm.get_committed_facts_for_prompt()
         check("overdue drift defended via capture (still 猫)",
-              facts == [{"topic": topic, "answer": "猫だよ"}], f"facts={facts}")
+              len(facts) == 1 and facts[0]["answer"] == "猫だよ", f"facts={facts}")
 
         # (c) a non-substantive answer ("うん") must NOT be captured.
         mode._maybe_commit_fact("…", "うん", is_internal_nudge=True)
@@ -269,6 +273,34 @@ async def test_release_facts_on_supersede() -> None:
         await _teardown(tm, path)
 
 
+async def test_facet_rotation() -> None:
+    print("\n--- ① Facet rotation: substance kept, expression variants accumulate ---")
+    tm, path = await _make_tm()
+    try:
+        await _commit_fact(tm, "好きな動物", "猫だよ、強い")
+        await _commit_fact(tm, "好きな動物", "猫かな、気まぐれが好き")  # same topic, NEW phrasing
+        facts = tm.get_committed_facts_for_prompt()
+        check("one fact, substance = first answer (defended)",
+              len(facts) == 1 and facts[0]["answer"] == "猫だよ、強い", f"facts={facts}")
+        exprs = facts[0].get("recent_expressions", [])
+        check("first expression retained", "猫だよ、強い" in exprs, f"exprs={exprs}")
+        check("new expression variant accumulated", "猫かな、気まぐれが好き" in exprs, f"exprs={exprs}")
+
+        # a drift attempt still does NOT change the substance (answer stays 猫だよ、強い)
+        await _commit_fact(tm, "好きな動物", "うさぎ")
+        facts2 = tm.get_committed_facts_for_prompt()
+        check("substance still defended after drift attempt",
+              facts2[0]["answer"] == "猫だよ、強い", f"answer={facts2[0]['answer']}")
+
+        # cap: variants bounded (<= 4)
+        for v in ["猫、しっくりくる", "猫、落ち着く", "猫が好き"]:
+            await _commit_fact(tm, "好きな動物", v)
+        exprs2 = tm.get_committed_facts_for_prompt()[0]["recent_expressions"]
+        check("expression variants capped (<=4)", len(exprs2) <= 4, f"n={len(exprs2)}")
+    finally:
+        await _teardown(tm, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
@@ -278,6 +310,7 @@ async def main() -> None:
     await test_committed_fact_recovery()
     await test_capture_maybe_commit_fact()
     await test_release_facts_on_supersede()
+    await test_facet_rotation()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
