@@ -54,13 +54,15 @@ def run() -> None:
         return
     check("_build_system_prompt runs without error", True)
     check("committed-facts block header present",
-          "中身(substance)は firm" in prompt)
+          "中身も理由も firm" in prompt)
     check("committed fact value rendered (好きな動物 = 猫だよ)",
           "好きな動物 = 猫だよ" in prompt)
     check("anti-drift wording present (猫→うさぎ禁止)",
-          "猫と言ったのに後でうさぎ" in prompt)
-    check("expression-diversity wording present (表現は毎回変える)",
-          "表現は毎回変える" in prompt)
+          "猫→うさぎは禁止" in prompt)
+    check("reason-consistency wording present (理由もでっち上げない)",
+          "好きな理由も毎回でっち上げず一貫" in prompt)
+    check("anti-verbatim wording present (全く同じ発話をしない)",
+          "全く同じ発話をしない" in prompt and "一字一句そのまま言わない" in prompt)
     check("Phase-0 nudge self-memory block also renders",
           "この沈黙中に自分が既に言ったこと" in prompt)
 
