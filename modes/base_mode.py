@@ -239,6 +239,61 @@ class BaseMode(ABC):
             "source": "nudge" if is_internal_nudge else "conversation",
         })
 
+    @staticmethod
+    def _dedup_runaway(text: str) -> str:
+        """暴走（同一発話が丸ごと二重に出力される degeneration）を検出してトリムする。
+        保守的: 全体を中点付近の文末で二分割し、前半後半がほぼ同一(>=0.95)かつ前半が十分長い
+        ときだけ前半に切る。正当な短い繰り返し（「うんうん」等）や別内容の連結は触らない。"""
+        t = (text or "").strip()
+        if len(t) < 30:
+            return text
+        mid = len(t) // 2
+        span = max(8, len(t) // 5)
+        best = None
+        for d in range(0, span):
+            for j in (mid - d, mid + d):
+                if 0 < j < len(t) and t[j - 1] in "。！？!?":
+                    best = j
+                    break
+            if best is not None:
+                break
+        if best is None:
+            return text
+        a, b = t[:best].strip(), t[best:].strip()
+        if a and b and len(a) >= 12:
+            from difflib import SequenceMatcher
+            if SequenceMatcher(None, a, b).ratio() >= 0.95:
+                return a
+        return text
+
+    def _auto_complete_overdue_if_needed(self, input_text: str, ai_response: str) -> None:
+        """Safety net: 期限超過 nudge で Eve が実発話したのに clear(done) を呼ばなかったら、
+        テキスト品質に依存せず done を自動確定する（タスクが未完で残る脆さを塞ぐ）。
+        - LLM が既に clear 済 (PROVISIONAL_DONE/DONE) なら何もしない (status==active ガードで二重防止)。
+        - 相槌/空発話/極端に短い応答では自動完了しない (A2 ゲート相当 + 長さガード)。
+        - eve_response 付きで enqueue → PROVISIONAL_DONE → AI2 audit を通すので off-topic は弾ける。"""
+        if self.task_manager is None:
+            return
+        import re as _re
+        m = _re.search(r"\[内部: 期限超過(?:再判定)?\s+(i_[0-9a-f]+)", input_text or "")
+        if not m:
+            return
+        iid = m.group(1)
+        inst = self.task_manager.get_instruction(iid)
+        if not inst or inst.get("status") != "active":
+            return
+        spoken = (ai_response or "").strip()
+        if (not spoken) or (spoken in self._NONSUBSTANTIVE_FOR_COMMIT) or (len(spoken) < 4):
+            return
+        self.task_manager.enqueue_command_nowait({
+            "kind": "clear_active_instruction",
+            "id": iid,
+            "status": "done",
+            "eve_response": ai_response,
+            "reason": "auto: 実発話で履行を自動確定（clear 未呼び出しの保険）",
+        })
+        self.log("System", f"[AutoClear] overdue {iid} auto-completed (substantive)", level="debug")
+
     async def process_input(self, input_text: str, is_internal_nudge: bool = False) -> str:
         """
         テキスト入力を処理してAI応答を生成（外部 API は完全互換）。
@@ -418,6 +473,9 @@ class BaseMode(ABC):
             while sentence_queue:
                 await process_tts_batch()
 
+            # Dedup guard: 暴走（同一発話の丸ごと二重出力）を記録/コミット/clear の前にトリム。
+            ai_response = self._dedup_runaway(ai_response)
+
             # 応答をログに出力
             if ai_response:
                 self.log("AI", ai_response)
@@ -463,6 +521,15 @@ class BaseMode(ABC):
                 if self.feedback is not None:
                     try:
                         await self.task_manager.flush_command_queue(timeout=2.0)
+                        # Safety net: 期限超過の履行ターンで Eve が実発話したのに clear(done) を
+                        # 呼ばなかった場合、テキスト品質に依存せず done を自動確定する。
+                        # PROVISIONAL_DONE → AI2 audit を通すので off-topic は audit が弾ける。
+                        if is_internal_nudge:
+                            try:
+                                self._auto_complete_overdue_if_needed(input_text, ai_response)
+                                await self.task_manager.flush_command_queue(timeout=2.0)
+                            except Exception as e:  # noqa: BLE001
+                                self.log("System", f"[AutoClear] error: {e}", level="debug")
                         pending = self.task_manager.pop_pending_audits()
                         if pending:
                             # Fix-6 P2-g: audit に渡す文脈情報を 1 回だけ取得

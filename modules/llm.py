@@ -1207,6 +1207,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 tool_choice="auto",
                 temperature=Config.AI1_TEMPERATURE,
                 top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1218,6 +1220,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 tool_choice="auto",
                 temperature=Config.AI1_TEMPERATURE,
                 top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 max_tokens=self._fallback_max_tokens,
             )
 
@@ -1357,6 +1361,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 stream=True,
                 temperature=Config.AI1_TEMPERATURE,
                 top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 **{self._tokens_param: self._max_tokens},
             )
         except Exception as e:
@@ -1367,6 +1373,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 stream=True,
                 temperature=Config.AI1_TEMPERATURE,
                 top_p=Config.AI1_TOP_P,
+                frequency_penalty=Config.AI1_FREQUENCY_PENALTY,
+                presence_penalty=Config.AI1_PRESENCE_PENALTY,
                 max_tokens=self._fallback_max_tokens,
             )
 

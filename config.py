@@ -23,6 +23,9 @@ class Config:
     # ① Diversity: AI1 サンプリング（多様な応答のため。従来 0.7 固定から引き上げ）
     AI1_TEMPERATURE = float(os.getenv("AI1_TEMPERATURE", "0.85"))
     AI1_TOP_P = float(os.getenv("AI1_TOP_P", "0.9"))
+    # 反復抑制（OpenAI は反映、Groq は受理するが無視。既定 0 = 従来挙動）
+    AI1_FREQUENCY_PENALTY = float(os.getenv("AI1_FREQUENCY_PENALTY", "0.0"))
+    AI1_PRESENCE_PENALTY = float(os.getenv("AI1_PRESENCE_PENALTY", "0.0"))
     AI2_MODEL = os.getenv("AI2_MODEL_NAME", "claude-opus-4-5")
     AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-4o")
     AI2_MAX_TOKENS = int(os.getenv("AI2_MAX_TOKENS", "4000"))
