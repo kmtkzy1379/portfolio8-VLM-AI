@@ -229,6 +229,12 @@ class BaseMode(ABC):
             cands = self.task_manager.get_active_instructions_for_prompt()
             if len(cands) != 1:
                 return
+            # Bug-A gate: 期限未到来 (derived PENDING) の予約には「答え」がまだ存在しない。
+            # 予約受理の返事（「うん、30秒後に答えるね」）や待機中の雑談を fact として
+            # コミットしない（ライブで answer_text が了解発話に汚染された事故の根本対策）。
+            # 期限到来 (derived=active) の回答のみ帰属させる。督促 regex 経路は上で処理済み。
+            if cands[0].get("derived_status") != "active":
+                return
             iid = cands[0]["id"]
             instruction_text = cands[0]["instruction"]
         if not instruction_text:
@@ -244,6 +250,22 @@ class BaseMode(ABC):
             "instruction_id": iid,
             "source": "nudge" if is_internal_nudge else "conversation",
         })
+
+    @staticmethod
+    def _is_greeting(text: str) -> bool:
+        """発話冒頭が挨拶かどうか（Bug-E: nudge 自己記憶のタグ付け + 内部 nudge の再挨拶フィルタ用）。"""
+        import re as _re
+        return bool(_re.search(
+            r"(こんにち[はわ]|こんばん[はわ]|おはよ|やっほ|ハロー|はろー|^やあ\b)",
+            (text or "")[:20],
+        ))
+
+    def _greeting_already_done(self) -> bool:
+        """このセッションで挨拶が既に交わされたか（recent_turns の user/ai どちらかに挨拶）。"""
+        for t in (getattr(self.llm, "recent_turns", None) or []):
+            if self._is_greeting(str(t.get("user", ""))) or self._is_greeting(str(t.get("ai", ""))):
+                return True
+        return False
 
     @staticmethod
     def _dedup_runaway(text: str) -> str:
@@ -474,10 +496,19 @@ class BaseMode(ABC):
                     self._stage = ResponseStage.TTS_QUEUED
 
             self._stage = ResponseStage.LLM_STREAMING
+            # Bug-E(code gate): 内部 nudge で既に挨拶済みなら、応答の「先頭の挨拶文」を
+            # TTS/記録の前に剥がす（再挨拶の決定論的遮断。プロンプト規則では不十分と Tier-3 で確認）。
+            # 最初の非空文だけを検査するので、本文への影響は無い。実ユーザターンは対象外。
+            _greet_filter_armed = is_internal_nudge and self._greeting_already_done()
             # Fix-6 P1-c (3) LLM history 汚染防止: is_internal_nudge を伝搬
             async for sentence in self.llm.generate_stream(input_text, is_internal_nudge=is_internal_nudge):
                 if self.stop_requested or self.player.interrupt_signal:
                     break
+                if sentence.strip() and _greet_filter_armed:
+                    _greet_filter_armed = False  # 先頭の非空文のみ検査
+                    if self._is_greeting(sentence):
+                        self.log("System", f"[GreetFilter] 再挨拶を抑制: {sentence.strip()[:30]}", level="debug")
+                        continue  # ai_response にも TTS にも乗せない
                 ai_response += sentence
                 if sentence.strip():
                     sentence_queue.append(sentence)

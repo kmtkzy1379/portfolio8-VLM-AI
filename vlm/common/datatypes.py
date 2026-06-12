@@ -187,6 +187,9 @@ class NarrationRequest:
     screenshot: Optional[np.ndarray]
     frame_id: int
     is_reset: bool = False  # sentinel for scene cut
+    # Bug-C1: MAJOR 変化トリガのナレーションで True。蓄積 delta（切替前の記録）ではなく
+    # 現在のスクリーンショットを最優先で描写させる（古い画面を語る事故の根本対策）。
+    is_scene_change: bool = False
 
 
 # ── Phase 3 envelope ──

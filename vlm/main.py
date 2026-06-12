@@ -279,6 +279,7 @@ class Pipeline:
                     relations_text=request.relations_text,
                     memory_text=request.memory_text,
                     screenshot=request.screenshot,
+                    is_scene_change=getattr(request, "is_scene_change", False),
                 )
                 if narration:
                     # Determine the highest change level across all deltas
@@ -643,6 +644,9 @@ class Pipeline:
                         memory_text=mem_text_for_llm,
                         screenshot=frame.image.copy() if self._send_screenshot else None,
                         frame_id=frame.metadata.frame_id,
+                        # Bug-C1: MAJOR 変化時は蓄積 delta が「切替前」の記録に偏るため、
+                        # ナレーション側に screenshot 優先を指示する（古い画面描写の防止）。
+                        is_scene_change=(change_level == ChangeLevel.MAJOR),
                     )
                     try:
                         self._narration_queue.put_nowait(request)

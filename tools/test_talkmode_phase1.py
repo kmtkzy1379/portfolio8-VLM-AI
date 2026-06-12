@@ -58,8 +58,77 @@ def run_tests() -> None:
     check("real user turn resets _last_nudge_fire_ts", mode._last_nudge_fire_ts == 0.0)
 
 
+def run_greeting_tests() -> None:
+    print("\n--- Bug-E: _is_greeting matrix (tag-only detector) ---")
+    g = TalkMode._is_greeting
+    for text, expect in [
+        ("こんばんは！", True), ("こんばんわ、えへへ", True), ("こんにちは", True),
+        ("おはよー", True), ("やっほー、来たよ", True), ("ハロー！", True),
+        ("うん", False), ("そうなんだ", False), ("猫だよ、強い", False),
+        ("ローグライク進んだ？", False), ("", False),
+    ]:
+        check(f"_is_greeting({text!r}) == {expect}", g(text) == expect)
+
+    print("\n--- Bug-E: greeting spoken on a silence nudge is tagged [greeting] ---")
+
+    def _aret(v):
+        async def f():
+            return v
+        return f()
+
+    class GreetLLM:
+        def __init__(self):
+            self.history = []
+            self.rag_memories = []
+            self.recent_turns = []
+            self.silence_summary = None
+            self.committed_facts = []
+            self.nudge_self_memory = []
+            self.vlm_context = ""
+            self.one_shot_context = ""
+
+        def has_unseen_vlm_alerts(self, *_a, **_k):
+            return False
+
+        async def generate_stream(self, text, is_internal_nudge=False):
+            yield "こんばんは、えへへ。"
+
+    mode = TalkMode()
+    mode.llm = GreetLLM()
+    mode.rag = SimpleNamespace(
+        search_similar=lambda q, *a, **k: _aret([]),
+        get_random_turns=lambda count=2: _aret([]),
+    )
+    mode.conversation_cache = SimpleNamespace(
+        get_recent_turns=lambda count=5, exclude_ellipsis=False: _aret([]),
+        get_silence_summary=lambda: _aret({"silence_seconds": 12, "ellipsis_count": 0, "last_real_user_ts": None}),
+        add_turn=lambda u, a: _aret(None),
+    )
+    mode.tts = SimpleNamespace(generate_audio=lambda s: _aret(b""))
+    mode.player = SimpleNamespace(
+        add_to_queue=lambda w: None,
+        queue=SimpleNamespace(qsize=lambda: 0, empty=lambda: True),
+        is_playing=False, interrupt_signal=False,
+    )
+    mode.feedback = SimpleNamespace(signal_turn_done=lambda: None)
+    mode.task_manager = None
+    mode.vlm_bridge = None
+    mode.running = True
+    asyncio.get_event_loop()  # noqa: F841 (loop already running via _amain)
+    return mode
+
+
+async def _greeting_tag_async(mode) -> None:
+    await mode._process_idle_input("…", is_silence_nudge=True)
+    check("greeting response recorded with [greeting] tag",
+          mode._nudge_spoken and mode._nudge_spoken[-1]["category"] == "greeting",
+          f"spoken={mode._nudge_spoken}")
+
+
 async def _amain() -> None:
     run_tests()
+    mode = run_greeting_tests()
+    await _greeting_tag_async(mode)
 
 
 if __name__ == "__main__":

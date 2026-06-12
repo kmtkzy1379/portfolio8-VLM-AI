@@ -142,6 +142,25 @@ def test_proactive_block() -> None:
           "今日は何する？" in p_silence and "定型句" in p_silence)
     check("defers to busy/away/'黙ってて' -> 見守る",
           "黙ってて" in p_silence and "見守る" in p_silence)
+    check("Bug-E: no-re-greeting rule present (言い換え・相槌型含む)",
+          "セッションで1回まで" in p_silence and "相槌型" in p_silence and "再挨拶しない" in p_silence)
+    check("Bug-B3: no-early-fulfillment-from-conversation rule present",
+          "約束の早期履行" in p_silence and "自分から履行しない" in p_silence
+          and "匂わせない" in p_silence)
+    # [greeting] タグルールは nudge_self_memory がある時のみ（nudge_memory_context 内）
+    llm.nudge_self_memory = [{"category": "greeting", "text": "こんばんは、えへへ。"}]
+    p_with_greet = llm._build_system_prompt("…")
+    check("Bug-E: [greeting] tag rule present in nudge memory block",
+          "[greeting] が既にあれば挨拶系は一切出さない" in p_with_greet)
+    llm.nudge_self_memory = []
+    # Bug-F regression: RAG legacy_turn 描画が引数 user_text を shadow して proactive を
+    # 消していた（RAGあり+「…」の組合せが全テストで未検証だった穴）。必ず両立を確認する。
+    llm.rag_memories = [{"user": "コーヒーは何派？", "ai": "ブラック派かな"}]
+    p_rag = llm._build_system_prompt("…")
+    check("proactive block present on '…' EVEN WITH rag memories (Bug-F)", MARK in p_rag)
+    check("rag block also present (both coexist)", "Long-term Memory" in p_rag)
+    llm.rag_memories = []
+
     # Gate: must NOT appear on real user turns / VLM nudges / overdue nudges.
     check("absent on real user turn", MARK not in llm._build_system_prompt("好きな動物おしえて"))
     check("absent on VLM nudge",

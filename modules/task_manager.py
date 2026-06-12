@@ -908,6 +908,41 @@ class TaskManager:
         return {"topic": f.topic_norm, "answer": f.answer_text,
                 "recent_expressions": list(f.recent_expressions)}
 
+    def has_imminent_pending_instruction(self, window_sec: float = 120.0) -> bool:
+        """期限が window_sec 以内に迫った derived-PENDING 予約があるか（sync fast path）。
+
+        Bug-B(code gate): この間は沈黙 "…" nudge を発火しない（早期履行をコードで遮断）。
+        deadline 無し（既定 expire 待ち）の PENDING は対象外 — 長時間 Eve を黙らせない。
+        """
+        now = datetime.now()
+        for item in self.get_active_instructions_for_prompt():
+            if item.get("derived_status") != "pending" or not item.get("deadline_at"):
+                continue
+            try:
+                dl = datetime.fromisoformat(item["deadline_at"])
+            except (ValueError, TypeError):
+                continue
+            if 0 <= (dl - now).total_seconds() <= window_sec:
+                return True
+        return False
+
+    def _fact_blocked_by_pending_instruction(self, f) -> bool:
+        """Bug-B gate: 期限未到来 (derived PENDING) の予約に紐づく fact は描画しない。
+
+        Fix-8 が instruction_pending_block を内部 nudge で隠しても、committed_facts 経由で
+        〈予約トピック = …〉がリークすると沈黙 nudge が早期履行する（ライブで観測）。
+        render 側の常時バックストップ（ディスク上の汚染済み fact にも効く）。
+        期限到来 (ACTIVE) は描画する — 期限超過の履行で drift を守るのに必要。
+        終端/迷子/instruction_id=None は描画（ペルソナ持続）。
+        """
+        iid = getattr(f, "instruction_id", None)
+        if not iid:
+            return False
+        inst = self._active_instructions.get(iid)
+        if inst is None:
+            return False
+        return self._compute_derived_status(inst, datetime.now()) == InstructionStatus.PENDING
+
     def get_committed_facts_for_prompt(
         self, limit: int = 6, relevance_text: Optional[str] = None
     ) -> list[dict]:
@@ -918,7 +953,8 @@ class TaskManager:
         選んで最新 limit 件に絞る（嗜好が増えてもプロンプトが無限に伸びないようにする）。
         recent_floor が「直近コミットした事実」を必ず残すので、トークン照合の取りこぼしでもドリフト防御は保たれる。
         """
-        active = [f for f in self._committed_facts.values() if f.status == "active"]
+        active = [f for f in self._committed_facts.values()
+                  if f.status == "active" and not self._fact_blocked_by_pending_instruction(f)]
         active.sort(key=lambda f: f.committed_at)
 
         if not relevance_text or len(active) <= limit:
@@ -1122,6 +1158,21 @@ class TaskManager:
         if not instruction:
             task_logger.warning("[Instruction] set: empty instruction, skip")
             return
+
+        # Bug-D: 相対指定 (delay_seconds) はサーバ側で now+delay を計算して優先する。
+        # LLM の絶対時刻計算ミス（「30秒後」→ +58s や過去時刻）をクラスごと排除する。
+        # 不正値は無視して absolute fallback（既存の parse 防衛 / B2 クランプはそのまま生きる）。
+        delay = cmd.get("delay_seconds")
+        if delay is not None:
+            try:
+                d = float(delay)
+                if 0.0 < d <= 86400.0:
+                    deadline_at = (datetime.now() + timedelta(seconds=d)).isoformat()
+                    task_logger.info(
+                        "[Instruction] delay_seconds=%.0f -> deadline_at=%s", d, deadline_at,
+                    )
+            except (ValueError, TypeError):
+                pass
 
         # deadline_at の parse 防衛
         if deadline_at:

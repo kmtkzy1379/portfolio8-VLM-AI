@@ -165,8 +165,12 @@ class TalkMode(BaseMode):
             if has_new_alert:
                 # alert 消費の高水位を更新（二重展開防止）。VLM nudge は沈黙 backoff と直交。
                 self.state["_vlm_alerts_consumed_at"] = now
+                # Bug-C2: 最新 alert のナレーション本文を nudge に同梱し、
+                # 「画面が変わった」という事実だけでなく「何に変わったか」を直接渡す。
+                newest = self.llm.newest_vlm_alert()
+                snippet = (newest[1] or "").strip()[:100] if newest else ""
                 await self._process_idle_input(
-                    "[内部: 画面に新しい変化があった - 自然にリアクションして]",
+                    self._build_vlm_nudge_text(snippet),
                     is_silence_nudge=False,
                 )
             else:
@@ -182,6 +186,18 @@ class TalkMode(BaseMode):
                 self._last_nudge_fire_ts = now
                 await self._process_idle_input("…", is_silence_nudge=True)
 
+    @staticmethod
+    def _build_vlm_nudge_text(snippet: str) -> str:
+        """VLM nudge の入力テキストを構築（Bug-C2）。
+
+        注意: 全角ダッシュ「—」を含めないこと — base_mode の内部 nudge RAG-query 分岐
+        （input_text.split("—")）と督促 regex（[内部: 期限超過 …—…]）の専用記号のため。
+        """
+        snippet = (snippet or "").replace("—", "-").strip()
+        if snippet:
+            return f"[内部: 画面に新しい変化があった - 最新の画面: {snippet} - これに自然にリアクションして]"
+        return "[内部: 画面に新しい変化があった - 自然にリアクションして]"
+
     async def _process_idle_input(self, input_text: str, is_silence_nudge: bool = False):
         """無言時の自発発話処理（旧 _process_ellipsis）。
 
@@ -191,6 +207,20 @@ class TalkMode(BaseMode):
         VLM alert は llm._vlm_alerts に蓄積されているので、
         process_input → _build_system_prompt で自然に展開される。
         """
+        # Bug-B(code gate): 期限が迫った PENDING 予約がある間、沈黙 nudge は発火しない。
+        # 約束を待つ間は静かに待つ（自然な挙動）＋早期履行を決定論的に遮断＋LLM 呼び出し節約。
+        # プロンプト規則だけでは gpt-5.4-mini が守れないことを Tier-3 で確認済み。
+        # VLM nudge (is_silence_nudge=False) は対象外（画面反応は許可）。
+        if is_silence_nudge and self.task_manager is not None:
+            try:
+                if self.task_manager.has_imminent_pending_instruction(
+                    window_sec=Config.IDLE_SUPPRESS_PENDING_WINDOW_SEC
+                ):
+                    self.log("System", "[Idle] 期限が近い予約あり — 沈黙 nudge を抑制", level="debug")
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+
         self.state["busy_llm"] = True
         try:
             # 直近ターンを先に取得（RAG クエリの材料に再利用する）。
@@ -269,11 +299,14 @@ class TalkMode(BaseMode):
             if is_silence_nudge:
                 spoken = (response or "").strip()
                 if spoken and spoken != "…":
-                    rec_cat = (
-                        "check"
-                        if (allow_check and spoken.endswith(("？", "?")))
-                        else category
-                    )
+                    # Bug-E: 挨拶は [greeting] タグで控える（nudge_memory_context の
+                    # 「[greeting] が既にあれば挨拶系は出さない」ルールの根拠になる）。
+                    if self._is_greeting(spoken):
+                        rec_cat = "greeting"
+                    elif allow_check and spoken.endswith(("？", "?")):
+                        rec_cat = "check"
+                    else:
+                        rec_cat = category
                     self._nudge_spoken.append({"category": rec_cat, "text": spoken[:80]})
                     if len(self._nudge_spoken) > 8:
                         self._nudge_spoken = self._nudge_spoken[-8:]
