@@ -252,6 +252,22 @@ class BaseMode(ABC):
         })
 
     @staticmethod
+    def _is_greeting(text: str) -> bool:
+        """発話冒頭が挨拶かどうか（Bug-E: nudge 自己記憶のタグ付け + 内部 nudge の再挨拶フィルタ用）。"""
+        import re as _re
+        return bool(_re.search(
+            r"(こんにち[はわ]|こんばん[はわ]|おはよ|やっほ|ハロー|はろー|^やあ\b)",
+            (text or "")[:20],
+        ))
+
+    def _greeting_already_done(self) -> bool:
+        """このセッションで挨拶が既に交わされたか（recent_turns の user/ai どちらかに挨拶）。"""
+        for t in (getattr(self.llm, "recent_turns", None) or []):
+            if self._is_greeting(str(t.get("user", ""))) or self._is_greeting(str(t.get("ai", ""))):
+                return True
+        return False
+
+    @staticmethod
     def _dedup_runaway(text: str) -> str:
         """暴走（同一発話が丸ごと二重に出力される degeneration）を検出してトリムする。
         保守的: 全体を中点付近の文末で二分割し、前半後半がほぼ同一(>=0.95)かつ前半が十分長い
@@ -480,10 +496,19 @@ class BaseMode(ABC):
                     self._stage = ResponseStage.TTS_QUEUED
 
             self._stage = ResponseStage.LLM_STREAMING
+            # Bug-E(code gate): 内部 nudge で既に挨拶済みなら、応答の「先頭の挨拶文」を
+            # TTS/記録の前に剥がす（再挨拶の決定論的遮断。プロンプト規則では不十分と Tier-3 で確認）。
+            # 最初の非空文だけを検査するので、本文への影響は無い。実ユーザターンは対象外。
+            _greet_filter_armed = is_internal_nudge and self._greeting_already_done()
             # Fix-6 P1-c (3) LLM history 汚染防止: is_internal_nudge を伝搬
             async for sentence in self.llm.generate_stream(input_text, is_internal_nudge=is_internal_nudge):
                 if self.stop_requested or self.player.interrupt_signal:
                     break
+                if sentence.strip() and _greet_filter_armed:
+                    _greet_filter_armed = False  # 先頭の非空文のみ検査
+                    if self._is_greeting(sentence):
+                        self.log("System", f"[GreetFilter] 再挨拶を抑制: {sentence.strip()[:30]}", level="debug")
+                        continue  # ai_response にも TTS にも乗せない
                 ai_response += sentence
                 if sentence.strip():
                     sentence_queue.append(sentence)

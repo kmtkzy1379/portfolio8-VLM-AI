@@ -142,8 +142,11 @@ def test_proactive_block() -> None:
           "今日は何する？" in p_silence and "定型句" in p_silence)
     check("defers to busy/away/'黙ってて' -> 見守る",
           "黙ってて" in p_silence and "見守る" in p_silence)
-    check("Bug-E: no-re-greeting rule present (言い換え含む)",
-          "セッションで1回まで" in p_silence and "どんな言い換えでも再挨拶しない" in p_silence)
+    check("Bug-E: no-re-greeting rule present (言い換え・相槌型含む)",
+          "セッションで1回まで" in p_silence and "相槌型" in p_silence and "再挨拶しない" in p_silence)
+    check("Bug-B3: no-early-fulfillment-from-conversation rule present",
+          "約束の早期履行" in p_silence and "自分から履行しない" in p_silence
+          and "匂わせない" in p_silence)
     # [greeting] タグルールは nudge_self_memory がある時のみ（nudge_memory_context 内）
     llm.nudge_self_memory = [{"category": "greeting", "text": "こんばんは、えへへ。"}]
     p_with_greet = llm._build_system_prompt("…")

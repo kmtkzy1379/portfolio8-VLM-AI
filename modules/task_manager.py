@@ -908,6 +908,24 @@ class TaskManager:
         return {"topic": f.topic_norm, "answer": f.answer_text,
                 "recent_expressions": list(f.recent_expressions)}
 
+    def has_imminent_pending_instruction(self, window_sec: float = 120.0) -> bool:
+        """期限が window_sec 以内に迫った derived-PENDING 予約があるか（sync fast path）。
+
+        Bug-B(code gate): この間は沈黙 "…" nudge を発火しない（早期履行をコードで遮断）。
+        deadline 無し（既定 expire 待ち）の PENDING は対象外 — 長時間 Eve を黙らせない。
+        """
+        now = datetime.now()
+        for item in self.get_active_instructions_for_prompt():
+            if item.get("derived_status") != "pending" or not item.get("deadline_at"):
+                continue
+            try:
+                dl = datetime.fromisoformat(item["deadline_at"])
+            except (ValueError, TypeError):
+                continue
+            if 0 <= (dl - now).total_seconds() <= window_sec:
+                return True
+        return False
+
     def _fact_blocked_by_pending_instruction(self, f) -> bool:
         """Bug-B gate: 期限未到来 (derived PENDING) の予約に紐づく fact は描画しない。
 

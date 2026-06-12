@@ -194,6 +194,9 @@ class Config:
     IDLE_BASE_SEC        = float(os.getenv("IDLE_BASE_SEC",        "8"))
     IDLE_BACKOFF_FACTOR  = float(os.getenv("IDLE_BACKOFF_FACTOR",  "1.8"))
     IDLE_BACKOFF_CAP_SEC = float(os.getenv("IDLE_BACKOFF_CAP_SEC", "90"))
+    # Bug-B(code gate): 期限がこの秒数以内に迫った PENDING 予約がある間は沈黙 "…" nudge を
+    # 発火しない（約束の早期履行をコードで遮断。プロンプト規則は gpt-5.4-mini が守れなかった）。
+    IDLE_SUPPRESS_PENDING_WINDOW_SEC = float(os.getenv("IDLE_SUPPRESS_PENDING_WINDOW_SEC", "120"))
 
 
     @staticmethod

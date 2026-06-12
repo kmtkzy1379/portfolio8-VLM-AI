@@ -187,15 +187,6 @@ class TalkMode(BaseMode):
                 await self._process_idle_input("…", is_silence_nudge=True)
 
     @staticmethod
-    def _is_greeting(text: str) -> bool:
-        """発話冒頭が挨拶かどうか（Bug-E: nudge 自己記憶のタグ付け専用、出力遮断には使わない）。"""
-        import re as _re
-        return bool(_re.search(
-            r"(こんにち[はわ]|こんばん[はわ]|おはよ|やっほ|ハロー|はろー|^やあ\b)",
-            (text or "")[:20],
-        ))
-
-    @staticmethod
     def _build_vlm_nudge_text(snippet: str) -> str:
         """VLM nudge の入力テキストを構築（Bug-C2）。
 
@@ -216,6 +207,20 @@ class TalkMode(BaseMode):
         VLM alert は llm._vlm_alerts に蓄積されているので、
         process_input → _build_system_prompt で自然に展開される。
         """
+        # Bug-B(code gate): 期限が迫った PENDING 予約がある間、沈黙 nudge は発火しない。
+        # 約束を待つ間は静かに待つ（自然な挙動）＋早期履行を決定論的に遮断＋LLM 呼び出し節約。
+        # プロンプト規則だけでは gpt-5.4-mini が守れないことを Tier-3 で確認済み。
+        # VLM nudge (is_silence_nudge=False) は対象外（画面反応は許可）。
+        if is_silence_nudge and self.task_manager is not None:
+            try:
+                if self.task_manager.has_imminent_pending_instruction(
+                    window_sec=Config.IDLE_SUPPRESS_PENDING_WINDOW_SEC
+                ):
+                    self.log("System", "[Idle] 期限が近い予約あり — 沈黙 nudge を抑制", level="debug")
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+
         self.state["busy_llm"] = True
         try:
             # 直近ターンを先に取得（RAG クエリの材料に再利用する）。
