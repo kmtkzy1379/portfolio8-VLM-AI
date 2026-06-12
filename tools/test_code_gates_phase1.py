@@ -205,9 +205,146 @@ async def test_e_filter() -> None:
           resp5 == "ローグライク、進んだ？", f"resp={resp5!r}")
 
 
+async def test_g4_ack_filter() -> None:
+    print("\n--- Fix-G4: bare-ack filter on internal nudges ---")
+    from modes.base_mode import BaseMode
+    for text, expect in [("了解。", True), ("わかった！", True), ("OK", True), ("うん。", True),
+                         ("了解、いまやるね。", False), ("サーモンだよ。", False), ("", False)]:
+        check(f"_is_bare_ack({text!r}) == {expect}", BaseMode._is_bare_ack(text) == expect)
+
+    # 内部 nudge: 裸の相槌だけの応答 → 空（黙る）
+    llm = CountingLLM(["了解。"])
+    mode = _make_mode(llm)
+    resp = await mode.process_input("…", is_internal_nudge=True)
+    check("bare ack on nudge -> suppressed to empty", (resp or "").strip() == "", f"resp={resp!r}")
+
+    # 内部 nudge: 相槌 + 本文 → 本文ごと残る（先頭文が bare-ack でない）
+    llm2 = CountingLLM(["了解、いまやるね。", "サーモンが好き。"])
+    mode2 = _make_mode(llm2)
+    resp2 = await mode2.process_input("…", is_internal_nudge=True)
+    check("ack-with-content NOT suppressed", resp2.startswith("了解、いまやるね。"), f"resp={resp2!r}")
+
+    # 実ユーザターン: 裸の相槌も正当（フィルタ対象外）
+    llm3 = CountingLLM(["了解。"])
+    mode3 = _make_mode(llm3)
+    resp3 = await mode3.process_input("黙ってて", is_internal_nudge=False)
+    check("real turn bare ack kept", resp3 == "了解。", f"resp={resp3!r}")
+
+
+async def test_g1_fulfill_memory() -> None:
+    print("\n--- Fix-G1: overdue fulfillment recorded as [fulfill] in nudge self-memory ---")
+    llm = CountingLLM(["サーモンだよ。"])
+    mode = _make_mode(llm)
+    await mode._run_input_with_cleanup("[内部: 期限超過 i_x を履行 — 好きな寿司を答える]",
+                                       is_internal_nudge=True)
+    check("fulfillment appended to _nudge_spoken as [fulfill]",
+          mode._nudge_spoken and mode._nudge_spoken[-1]["category"] == "fulfill"
+          and "サーモン" in mode._nudge_spoken[-1]["text"],
+          f"spoken={mode._nudge_spoken}")
+
+    # 非督促の内部 nudge では記録しない（沈黙 nudge の記録は _process_idle_input が担当）
+    llm2 = CountingLLM(["なにか言う。"])
+    mode2 = _make_mode(llm2)
+    await mode2._run_input_with_cleanup("…", is_internal_nudge=True)
+    check("non-overdue input not recorded here", mode2._nudge_spoken == [],
+          f"spoken={mode2._nudge_spoken}")
+
+
+async def test_g2_recently_done() -> None:
+    print("\n--- Fix-G2: recently-done block (visibility of fulfilled reservations) ---")
+    from datetime import datetime, timedelta
+    from config import Config
+    Config.GROQ_API_KEY = Config.GROQ_API_KEY or "x"
+    Config.OPENAI_API_KEY = Config.OPENAI_API_KEY or "x"
+    from modules.llm import LLMHandler
+    tm, path = await _make_tm()
+    try:
+        now = datetime.now()
+        await _add(tm, "好きな寿司のネタを言う", iso(now + timedelta(seconds=30)))
+        iid = next(iter(tm._active_instructions.keys()))
+        check("no done yet -> getter empty", tm.get_recently_done_for_prompt() == [])
+        tm.enqueue_command_nowait({"kind": "clear_active_instruction", "id": iid,
+                                   "status": "done", "eve_response": "えびかな",
+                                   "reason": "履行"})
+        await tm.flush_command_queue()
+        done = tm.get_recently_done_for_prompt()
+        check("done within window -> returned",
+              len(done) == 1 and done[0]["instruction"] == "好きな寿司のネタを言う", f"done={done}")
+        # 古い完了（>600s）は出さない（done/provisional_done どちらの時刻フィールドでも）
+        _old = iso(now - timedelta(seconds=700))
+        tm._active_instructions[iid].cleared_at = _old
+        tm._active_instructions[iid].audit_pending_at = _old
+        check("stale done (>600s) excluded", tm.get_recently_done_for_prompt() == [])
+        tm._active_instructions[iid].cleared_at = iso(now)
+        tm._active_instructions[iid].audit_pending_at = iso(now)
+
+        llm = LLMHandler()
+        llm.system_prompt = "テスト"
+        llm.recent_turns = []
+        llm.silence_summary = None
+        llm.committed_facts = []
+        llm.nudge_self_memory = []
+        llm.rag_memories = []
+        llm.vlm_context = ""
+        llm.one_shot_context = ""
+        llm.set_task_manager(tm)
+        # 内部 nudge（PENDING 抑制下）でも表示されることが肝
+        llm._suppress_pending_block = True
+        p = llm._build_system_prompt("…")
+        check("recently-done block renders on internal nudge",
+              "直近に完了した予約" in p and "好きな寿司のネタを言う" in p)
+        check("anti-restate wording present", "再回答・再報告・蒸し返しは一切しない" in p)
+    finally:
+        await _teardown(tm, path)
+
+
+async def test_g5_postfulfill_gate() -> None:
+    print("\n--- Fix-G5: post-fulfillment silence nudges are question-only -> then silent ---")
+    fulfill_mem = [{"category": "fulfill", "text": "サーモンだよ。"}]
+
+    # 1) 履行後の沈黙 nudge: 再回答（平叙文）は落ち、質問は通る
+    llm = CountingLLM(["サーモンかな。", "聞こえてた？"])
+    mode = _make_mode(llm)
+    mode.llm.nudge_self_memory = list(fulfill_mem)
+    resp = await mode.process_input("…", is_internal_nudge=True)
+    check("statement dropped, question kept", resp.strip() == "聞こえてた？", f"resp={resp!r}")
+
+    # 2) 再回答のみの応答 → 空（黙る）
+    llm2 = CountingLLM(["サーモンかな。とろっとしてて好き。"])
+    mode2 = _make_mode(llm2)
+    mode2.llm.nudge_self_memory = list(fulfill_mem)
+    resp2 = await mode2.process_input("…", is_internal_nudge=True)
+    check("re-answer-only suppressed to empty", (resp2 or "").strip() == "", f"resp={resp2!r}")
+
+    # 3) 既に質問済み（[fulfill]+質問が memory にある）→ 質問も落ちて沈黙のみ
+    llm3 = CountingLLM(["まだ聞こえてる？"])
+    mode3 = _make_mode(llm3)
+    mode3.llm.nudge_self_memory = fulfill_mem + [{"category": "check", "text": "聞こえてた？"}]
+    resp3 = await mode3.process_input("…", is_internal_nudge=True)
+    check("after one question -> full silence", (resp3 or "").strip() == "", f"resp={resp3!r}")
+
+    # 4) [fulfill] が無ければゲートは無効（通常の沈黙 nudge は自由）
+    llm4 = CountingLLM(["ローグライク進んだ？いや、画面見る限り苦戦してそう。"])
+    mode4 = _make_mode(llm4)
+    resp4 = await mode4.process_input("…", is_internal_nudge=True)
+    check("no fulfill -> gate inactive", resp4.startswith("ローグライク"), f"resp={resp4!r}")
+
+    # 5) VLM nudge は対象外（[fulfill] があっても画面反応の平叙文は通る）
+    llm5 = CountingLLM(["お、コードに切り替わったね。"])
+    mode5 = _make_mode(llm5)
+    mode5.llm.nudge_self_memory = list(fulfill_mem)
+    resp5 = await mode5.process_input("[内部: 画面に新しい変化があった - 自然にリアクションして]",
+                                      is_internal_nudge=True)
+    check("VLM nudge exempt from gate", resp5.startswith("お、コード"), f"resp={resp5!r}")
+
+
 async def main() -> None:
     await test_b_gate()
     await test_e_filter()
+    await test_g4_ack_filter()
+    await test_g1_fulfill_memory()
+    await test_g2_recently_done()
+    await test_g5_postfulfill_gate()
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
     print(f"\n=== {npass}/{total} checks passed ===")

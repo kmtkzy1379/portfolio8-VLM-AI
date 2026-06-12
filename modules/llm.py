@@ -686,7 +686,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 "この沈黙の場では自分から履行しない。期限が来れば [期限超過] の内部通知が必ず来る。"
                 "それまで答えを言わない・匂わせない（「いま言うなら〜」も禁止）。\n"
                 "  禁止3（定型句）: 中身の無い定型句（「今日は何する？」「いるよ？」「元気？」等）。"
-                "言うことが具体的に特定できないなら話さない。\n\n"
+                "言うことが具体的に特定できないなら話さない。\n"
+                "  禁止4（再返信）: Recent Conversation の最後のユーザー発話には既に返事済み。"
+                "同じ発話への返信・相槌・続きをもう一度言わない。話すなら“新しい”素材"
+                "（画面でいま起きていること・記憶・まだ触れていない角度）から振る。\n\n"
             )
 
         # A1: この沈黙中に自分が既に言ったこと（nudge 自己記憶）。同じ話題・言い回しの反復を防ぐ。
@@ -702,6 +705,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 f"{_mem_lines}\n"
                 "  ※ 同じ話題・同じ言い回しを再提示しない。確認質問は1ストリークに1回まで"
                 "（[check] が既にあれば出さない）。[greeting] が既にあれば挨拶系は一切出さない。"
+                "[fulfill] は履行済みの答え — その内容を繰り返さない。返事が無いままなら"
+                "一度だけ短く様子を聞き（聞こえてた？等）、その後は「…」で見守る。"
                 "沈黙が深いほど「…」を選ぶ。\n\n"
             )
 
@@ -864,6 +869,28 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         if getattr(self, "_suppress_pending_block", False):
             instruction_pending_block = ""
 
+        # Fix-G2: 直近に完了した予約を可視化。履行発話は会話履歴に残らない（Fix-6）ため、
+        # これが無いと沈黙 nudge から「約束したのに未回答」に見えて同じ答えを何度も繰り返す
+        # （実機 2026-06-13 で観測）。内部 nudge でも必ず表示（_suppress_pending_block 対象外）。
+        recently_done_block = ""
+        if self._task_manager is not None:
+            try:
+                _done = self._task_manager.get_recently_done_for_prompt()
+            except Exception:  # noqa: BLE001
+                _done = []
+            if _done:
+                _dl = "\n".join(
+                    f"  - 〈{d['instruction']}〉（{self._format_alert_age(d['age_sec'])}に履行済み）"
+                    for d in _done
+                )
+                recently_done_block = (
+                    "\n[直近に完了した予約（履行済み）]:\n"
+                    f"{_dl}\n"
+                    "  ※ これらは既に答えた・実行した。再回答・再報告・蒸し返しは一切しない"
+                    "（沈黙が続いても同じ答えを繰り返さない。返事が無いのが気になるなら、"
+                    "答えの再掲ではなく一度だけ短く様子を聞く）。\n"
+                )
+
         # affect→tone（弱い口調ヒント・過去情報）。AI2 が算出した感情を「古い可能性のある
         # 補助ヒント」として短く注入する。TTL/信頼度ゲートで失効し、期限超過 active 時は
         # 履行優先のため抑制。現在文脈が最優先で、矛盾なら無視。プロンプト文字列のみで、
@@ -929,6 +956,7 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             + rag_context + silence_context + proactive_silence_context
             + nudge_memory_context + committed_facts_context
             + affect_tone_context + recent_context
+            + recently_done_block
             + instruction_pending_block
             + goal_block
             + one_shot_block + now_block

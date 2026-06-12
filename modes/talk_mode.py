@@ -194,9 +194,14 @@ class TalkMode(BaseMode):
         （input_text.split("—")）と督促 regex（[内部: 期限超過 …—…]）の専用記号のため。
         """
         snippet = (snippet or "").replace("—", "-").strip()
+        # Fix-H: 「毎回画面に具体的に言及されるのはウザい」（実機フィードバック）→ 反応は任意。
+        # 文脈に合うときだけ軽く触れ、合わなければ「…」。実況・報告口調は禁止。
         if snippet:
-            return f"[内部: 画面に新しい変化があった - 最新の画面: {snippet} - これに自然にリアクションして]"
-        return "[内部: 画面に新しい変化があった - 自然にリアクションして]"
+            return (f"[内部: 画面に新しい変化があった - 最新の画面: {snippet} - "
+                    "文脈に合うなら軽く触れていい（必須ではない、合わなければ「…」でいい）。"
+                    "画面の実況・報告はしない]")
+        return ("[内部: 画面に新しい変化があった - 文脈に合うなら軽く触れていい"
+                "（必須ではない、合わなければ「…」でいい）。画面の実況・報告はしない]")
 
     async def _process_idle_input(self, input_text: str, is_silence_nudge: bool = False):
         """無言時の自発発話処理（旧 _process_ellipsis）。
@@ -530,6 +535,8 @@ class TalkMode(BaseMode):
         Fix-6 P1-b: is_internal_nudge を process_input に伝搬する。
         """
         try:
+            # Fix-G1 の [fulfill] 記録は base_mode の pipeline 末尾で行う
+            # （process_input を直接呼ぶ全経路をカバーするため。ここでは記録しない）。
             await self.process_input(input_text, is_internal_nudge=is_internal_nudge)
         except asyncio.CancelledError:
             pass

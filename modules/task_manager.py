@@ -908,6 +908,32 @@ class TaskManager:
         return {"topic": f.topic_norm, "answer": f.answer_text,
                 "recent_expressions": list(f.recent_expressions)}
 
+    def get_recently_done_for_prompt(self, n: int = 2, max_age_sec: float = 600.0) -> list[dict]:
+        """直近に完了 (DONE / PROVISIONAL_DONE) した予約を返す（sync fast path, Fix-G2）。
+
+        履行発話は Fix-6 で会話履歴に残らないため、後続ターン（特に沈黙 nudge）からは
+        「約束したのに未回答」に見えて同じ答えを何度も繰り返す（実機 2026-06-13 で観測）。
+        このリストを prompt に出して「もう履行済み」を可視化する。
+        """
+        now = datetime.now()
+        done: list[tuple[str, dict]] = []
+        for inst in self._active_instructions.values():
+            if inst.status == InstructionStatus.DONE:
+                ts = inst.cleared_at or ""
+            elif inst.status == InstructionStatus.PROVISIONAL_DONE:
+                ts = inst.audit_pending_at or ""
+            else:
+                continue
+            try:
+                age = (now - datetime.fromisoformat(ts)).total_seconds() if ts else None
+            except (ValueError, TypeError):
+                age = None
+            if age is None or age > max_age_sec or age < 0:
+                continue
+            done.append((ts, {"instruction": inst.instruction, "age_sec": age}))
+        done.sort(key=lambda x: x[0])
+        return [d for _, d in done[-n:]]
+
     def has_imminent_pending_instruction(self, window_sec: float = 120.0) -> bool:
         """期限が window_sec 以内に迫った derived-PENDING 予約があるか（sync fast path）。
 

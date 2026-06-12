@@ -260,6 +260,21 @@ class BaseMode(ABC):
             (text or "")[:20],
         ))
 
+    _BARE_ACK_LEXICON = frozenset(
+        {"了解", "りょうかい", "わかった", "わかったよ", "わかりました", "ok", "おけ",
+         "おっけー", "うん", "はい", "ありがと", "ありがとう", "どういたしまして",
+         "承知", "そっか", "あいよ", "おっけ"}
+    )
+
+    @classmethod
+    def _is_bare_ack(cls, text: str) -> bool:
+        """発話が裸の相槌（了解/わかった等）だけかどうか（Fix-G4: 内部 nudge 用）。
+        正規化（句読点・記号除去 + lower）後の完全一致のみ。本文付きは対象外。"""
+        t = (text or "").strip().lower()
+        for ch in "。．.!！?？、,…〜~ 　":
+            t = t.replace(ch, "")
+        return t in cls._BARE_ACK_LEXICON
+
     def _greeting_already_done(self) -> bool:
         """このセッションで挨拶が既に交わされたか（recent_turns の user/ai どちらかに挨拶）。"""
         for t in (getattr(self.llm, "recent_turns", None) or []):
@@ -500,15 +515,41 @@ class BaseMode(ABC):
             # TTS/記録の前に剥がす（再挨拶の決定論的遮断。プロンプト規則では不十分と Tier-3 で確認）。
             # 最初の非空文だけを検査するので、本文への影響は無い。実ユーザターンは対象外。
             _greet_filter_armed = is_internal_nudge and self._greeting_already_done()
+            # Fix-G4(code gate): 内部 nudge の応答が裸の相槌（「了解」「わかった」等）だけなら
+            # 剥がす。沈黙 nudge に裸の相槌は文脈不明（実機の「了解」事故）。先頭の非空文のみ検査。
+            _ack_filter_armed = is_internal_nudge
+            # Fix-G5(code gate): 履行済み（[fulfill]）なのにユーザー無言が続く沈黙 nudge は
+            # 「質問のみ」許可（様子聞き・確認 = 望ましい適応行動）。既に質問済みなら沈黙のみ。
+            # 同じ答えの再回答はプロンプト規則・履行可視化でも止まらなかった（Tier-3 S1 0/2）
+            # ため、文単位で構造的に遮断する。VLM/督促 nudge は対象外（inputが「…」の時のみ）。
+            _postfulfill_mode = None
+            if is_internal_nudge and input_text.strip() == "…":
+                _pf_mem = getattr(self.llm, "nudge_self_memory", None) or []
+                if any(m.get("category") == "fulfill" for m in _pf_mem):
+                    _asked = any((m.get("text") or "").rstrip().endswith(("？", "?"))
+                                 for m in _pf_mem)
+                    _postfulfill_mode = "silence" if _asked else "question_only"
             # Fix-6 P1-c (3) LLM history 汚染防止: is_internal_nudge を伝搬
             async for sentence in self.llm.generate_stream(input_text, is_internal_nudge=is_internal_nudge):
                 if self.stop_requested or self.player.interrupt_signal:
                     break
-                if sentence.strip() and _greet_filter_armed:
-                    _greet_filter_armed = False  # 先頭の非空文のみ検査
-                    if self._is_greeting(sentence):
+                if sentence.strip() and (_greet_filter_armed or _ack_filter_armed):
+                    _skip = False
+                    if _greet_filter_armed and self._is_greeting(sentence):
                         self.log("System", f"[GreetFilter] 再挨拶を抑制: {sentence.strip()[:30]}", level="debug")
+                        _skip = True
+                    elif _ack_filter_armed and self._is_bare_ack(sentence):
+                        self.log("System", f"[AckFilter] 裸の相槌を抑制: {sentence.strip()[:30]}", level="debug")
+                        _skip = True
+                    _greet_filter_armed = _ack_filter_armed = False  # 先頭の非空文のみ検査
+                    if _skip:
                         continue  # ai_response にも TTS にも乗せない
+                # Fix-G5: 履行後の無視ストリーク中は質問文のみ通す（質問済みなら全て落とす）。
+                if _postfulfill_mode and sentence.strip():
+                    _s = sentence.rstrip()
+                    if _postfulfill_mode == "silence" or not _s.endswith(("？", "?")):
+                        self.log("System", f"[PostFulfill] 再回答/非質問を抑制: {_s[:30]}", level="debug")
+                        continue
                 ai_response += sentence
                 if sentence.strip():
                     sentence_queue.append(sentence)
@@ -521,6 +562,21 @@ class BaseMode(ABC):
 
             # Dedup guard: 暴走（同一発話の丸ごと二重出力）を記録/コミット/clear の前にトリム。
             ai_response = self._dedup_runaway(ai_response)
+
+            # Fix-G1: 督促履行の発話を nudge 自己記憶に控える（[fulfill] タグ）。
+            # 履行発話は履歴に残らない（Fix-6）ため、これが無いと後続の沈黙 nudge が
+            # 「まだ答えていない」と誤認して同じ答えを繰り返す（実機 2026-06-13 で観測）。
+            # process_input を呼ぶ全経路をカバーするためパイプライン末尾（チョークポイント）で記録。
+            if (
+                is_internal_nudge
+                and input_text.startswith("[内部: 期限超過")
+                and hasattr(self, "_nudge_spoken")
+            ):
+                _spoken = (ai_response or "").strip()
+                if _spoken and _spoken != "…":
+                    self._nudge_spoken.append({"category": "fulfill", "text": _spoken[:80]})
+                    if len(self._nudge_spoken) > 8:
+                        self._nudge_spoken = self._nudge_spoken[-8:]
 
             # 応答をログに出力
             if ai_response:
