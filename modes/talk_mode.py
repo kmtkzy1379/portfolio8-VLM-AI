@@ -187,6 +187,15 @@ class TalkMode(BaseMode):
                 await self._process_idle_input("…", is_silence_nudge=True)
 
     @staticmethod
+    def _is_greeting(text: str) -> bool:
+        """発話冒頭が挨拶かどうか（Bug-E: nudge 自己記憶のタグ付け専用、出力遮断には使わない）。"""
+        import re as _re
+        return bool(_re.search(
+            r"(こんにち[はわ]|こんばん[はわ]|おはよ|やっほ|ハロー|はろー|^やあ\b)",
+            (text or "")[:20],
+        ))
+
+    @staticmethod
     def _build_vlm_nudge_text(snippet: str) -> str:
         """VLM nudge の入力テキストを構築（Bug-C2）。
 
@@ -285,11 +294,14 @@ class TalkMode(BaseMode):
             if is_silence_nudge:
                 spoken = (response or "").strip()
                 if spoken and spoken != "…":
-                    rec_cat = (
-                        "check"
-                        if (allow_check and spoken.endswith(("？", "?")))
-                        else category
-                    )
+                    # Bug-E: 挨拶は [greeting] タグで控える（nudge_memory_context の
+                    # 「[greeting] が既にあれば挨拶系は出さない」ルールの根拠になる）。
+                    if self._is_greeting(spoken):
+                        rec_cat = "greeting"
+                    elif allow_check and spoken.endswith(("？", "?")):
+                        rec_cat = "check"
+                    else:
+                        rec_cat = category
                     self._nudge_spoken.append({"category": rec_cat, "text": spoken[:80]})
                     if len(self._nudge_spoken) > 8:
                         self._nudge_spoken = self._nudge_spoken[-8:]
