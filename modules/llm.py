@@ -622,11 +622,13 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                         rag_context += f" — {long_}"
                     rag_context += "\n"
                 else:  # legacy_turn (type 無し旧 entry も含む)
-                    user_text = memory.get("user", "")
-                    ai_text = memory.get("ai", "")
-                    if user_text or ai_text:
-                        rag_context += f"{i}. User: {user_text}\n"
-                        rag_context += f"   AI: {ai_text}\n"
+                    # NOTE: 変数名を user_text にすると関数引数を shadow して下流の
+                    # 「user_text == "…"」ゲート（proactive 等）を破壊する（Bug-F で実害）。
+                    mem_user = memory.get("user", "")
+                    mem_ai = memory.get("ai", "")
+                    if mem_user or mem_ai:
+                        rag_context += f"{i}. User: {mem_user}\n"
+                        rag_context += f"   AI: {mem_ai}\n"
             rag_context += "\n"
 
         # 沈黙サマリ (recent_turns から「…」を除外して失った情報を補う)
