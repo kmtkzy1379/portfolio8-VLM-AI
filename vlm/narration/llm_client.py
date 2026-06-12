@@ -71,6 +71,7 @@ class NarrationEngine:
         relations_text: str = "",
         memory_text: str = "",
         screenshot: np.ndarray | None = None,
+        is_scene_change: bool = False,
     ) -> str | None:
         """Generate narration for frame delta(s).
 
@@ -82,6 +83,8 @@ class NarrationEngine:
             relations_text: Scene graph spatial relation text.
             memory_text: Working memory episodic text.
             screenshot: Full screen image for LLM vision.
+            is_scene_change: True なら MAJOR 変化トリガ。蓄積 delta は切替前の記録なので
+                スクリーンショット（今の画面）を最優先で描写させる（Bug-C1）。
         """
         now = time.monotonic()
         if now - self._last_call_time < self._min_interval:
@@ -100,6 +103,7 @@ class NarrationEngine:
             relations_text=relations_text,
             memory_text=memory_text,
             screenshot=screenshot,
+            is_scene_change=is_scene_change,
         )
 
         # Call LLM

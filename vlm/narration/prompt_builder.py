@@ -73,6 +73,7 @@ class PromptBuilder:
         relations_text: str = "",
         memory_text: str = "",
         screenshot: np.ndarray | None = None,
+        is_scene_change: bool = False,
     ) -> list[dict]:
         """Build message list for LLM API call.
 
@@ -83,6 +84,9 @@ class PromptBuilder:
             relations_text: Scene graph relation text (compact or delta).
             memory_text: Working memory episodic text.
             screenshot: Full screen image to include for LLM vision.
+            is_scene_change: True なら MAJOR 変化トリガ（Bug-C1）。蓄積 delta と
+                「前回の観測」は切替前の画面の記録なので、スクリーンショット
+                （今の画面）を最優先で描写するよう指示を先頭に挿入する。
 
         Returns:
             List of message dicts in OpenAI-compatible format.
@@ -111,6 +115,19 @@ class PromptBuilder:
             compact_text += f"\n{memory_text}"
 
         content_parts: list[dict] = []
+
+        # Bug-C1: 画面切替トリガ時は「今の画面」を最優先で描写させる。
+        # 蓄積 delta / 前回の観測は切替前の記録なので、現在の説明には使わせない。
+        if is_scene_change:
+            content_parts.append({
+                "type": "text",
+                "text": (
+                    "【画面切替】直前に画面が大きく切り替わった。スクリーンショットが「今」の画面。"
+                    "観測データの古いフレームと「前回の観測」は切替前の画面の記録なので、"
+                    "現在の画面の説明には使わない（必要なら『〜から切り替わった』とだけ短く触れる）。"
+                    "今この瞬間に映っているものを最優先で説明すること。"
+                ),
+            })
 
         # Add screenshot as the first image (before text)
         if screenshot is not None:
