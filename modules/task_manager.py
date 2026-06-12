@@ -908,6 +908,23 @@ class TaskManager:
         return {"topic": f.topic_norm, "answer": f.answer_text,
                 "recent_expressions": list(f.recent_expressions)}
 
+    def _fact_blocked_by_pending_instruction(self, f) -> bool:
+        """Bug-B gate: 期限未到来 (derived PENDING) の予約に紐づく fact は描画しない。
+
+        Fix-8 が instruction_pending_block を内部 nudge で隠しても、committed_facts 経由で
+        〈予約トピック = …〉がリークすると沈黙 nudge が早期履行する（ライブで観測）。
+        render 側の常時バックストップ（ディスク上の汚染済み fact にも効く）。
+        期限到来 (ACTIVE) は描画する — 期限超過の履行で drift を守るのに必要。
+        終端/迷子/instruction_id=None は描画（ペルソナ持続）。
+        """
+        iid = getattr(f, "instruction_id", None)
+        if not iid:
+            return False
+        inst = self._active_instructions.get(iid)
+        if inst is None:
+            return False
+        return self._compute_derived_status(inst, datetime.now()) == InstructionStatus.PENDING
+
     def get_committed_facts_for_prompt(
         self, limit: int = 6, relevance_text: Optional[str] = None
     ) -> list[dict]:
@@ -918,7 +935,8 @@ class TaskManager:
         選んで最新 limit 件に絞る（嗜好が増えてもプロンプトが無限に伸びないようにする）。
         recent_floor が「直近コミットした事実」を必ず残すので、トークン照合の取りこぼしでもドリフト防御は保たれる。
         """
-        active = [f for f in self._committed_facts.values() if f.status == "active"]
+        active = [f for f in self._committed_facts.values()
+                  if f.status == "active" and not self._fact_blocked_by_pending_instruction(f)]
         active.sort(key=lambda f: f.committed_at)
 
         if not relevance_text or len(active) <= limit:

@@ -262,6 +262,10 @@ async def test_release_facts_on_supersede() -> None:
         now = datetime.now()
         await _add_instruction(tm, "好きな動物を答える", iso(now + timedelta(seconds=30)))
         iid = next(iter(tm._active_instructions.keys()))
+        # Bug-B gate: PENDING 紐づき fact は prompt に出ないため、実フロー同様に
+        # 期限到来（derived ACTIVE）へ進めてから fact を確認する。
+        tm._active_instructions[iid].deadline_at = iso(now - timedelta(seconds=1))
+        await tm._reconcile_instruction_status()
         await _commit_fact(tm, "好きな動物", "猫だよ", iid=iid)
         check("fact active before cancel", len(tm.get_committed_facts_for_prompt()) == 1)
 
