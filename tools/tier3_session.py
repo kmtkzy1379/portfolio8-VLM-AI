@@ -17,8 +17,11 @@ Session invariants asserted per run:
 Scenario V (separate): stale-screen — old alert (news) + new alert (code editor); the
 VLM nudge response must reference the NEW screen, not the old one.
 
-Run:  $env:PYTHONIOENCODING="utf-8"; venv\\Scripts\\python.exe tools\\tier3_session.py [N]
+Run:  $env:PYTHONIOENCODING="utf-8"; venv\\Scripts\\python.exe tools\\tier3_session.py [N] [model_id]
 (real API cost; ~6-8 LLM calls per session run)
+
+model_id 省略時は Config.AI1_MODEL（本番同等）。指定時は litellm 経由でそのモデルを叩く
+（例: gpt-5.5 / anthropic/claude-sonnet-4-6 / gemini/gemini-3.5-flash）。本番コードは不変更。
 """
 import asyncio
 import os
@@ -67,6 +70,48 @@ def _greeting_count(outputs: list) -> int:
     return sum(1 for o in outputs if GREETING_RE.search(o or ""))
 
 
+MODEL_OVERRIDE: str = ""  # set from CLI; empty = production model
+
+
+class LiteLLMClient:
+    """OpenAI クライアント互換の薄い shim。litellm 経由で任意プロバイダのモデルを叩く。
+    drop_params=True で未対応パラメータ（例: Anthropic の frequency_penalty）は自動で落ちる。"""
+
+    def __init__(self, model: str):
+        self._model = model
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kw):
+        import litellm
+        litellm.drop_params = True
+        litellm.suppress_debug_info = True
+        kw["model"] = self._model
+        if "max_completion_tokens" in kw:
+            kw["max_tokens"] = kw.pop("max_completion_tokens")
+        try:
+            return await litellm.acompletion(**kw)
+        except Exception as e:
+            # reasoning 系 (gpt-5.5 等) は temperature/top_p/penalty を拒否する。
+            # 剥がして1回だけリトライ（モデル別仕様差の吸収。比較条件が変わる点は結果に明記）。
+            msg = str(e)
+            if "Unsupported value" in msg or "temperature" in msg or "not support" in msg:
+                for p in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                    kw.pop(p, None)
+                return await litellm.acompletion(**kw)
+            raise
+
+
+def _apply_model_override(llm) -> None:
+    if not MODEL_OVERRIDE:
+        return
+    shim = LiteLLMClient(MODEL_OVERRIDE)
+    llm.client = shim
+    llm.model = MODEL_OVERRIDE
+    # fallback も同じモデルに（groq への無言フォールバックで A/B が汚れないように）
+    llm._fallback_client = shim
+    llm._fallback_model = MODEL_OVERRIDE
+
+
 def _mentions_fish(text: str) -> bool:
     return any(t in (text or "") for t in FISH_TOKENS)
 
@@ -98,6 +143,7 @@ async def make_session():
     llm.rag_memories = []
     llm.vlm_context = ""
     llm.one_shot_context = ""
+    _apply_model_override(llm)
 
     mode = TalkMode()
     mode.llm = llm
@@ -322,7 +368,8 @@ async def main(n: int) -> None:
     if not (Config.GROQ_API_KEY and Config.OPENAI_API_KEY):
         print("Tier-3 needs GROQ/OPENAI keys in .env — aborting.")
         sys.exit(2)
-    print(f"Tier-3 session test: model AI1={Config.AI1_MODEL}, {n} run(s)\n")
+    model_label = MODEL_OVERRIDE or Config.AI1_MODEL
+    print(f"Tier-3 session test: model AI1={model_label}, {n} run(s)\n")
     tallies = {k: 0 for k in INVARIANTS}
     v_pass = 0
     extra = {"reservation_created": 0, "fulfilled_with_fish": 0}
@@ -368,4 +415,6 @@ async def main(n: int) -> None:
 
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+    if len(sys.argv) > 2:
+        MODEL_OVERRIDE = sys.argv[2]
     asyncio.run(main(n))
