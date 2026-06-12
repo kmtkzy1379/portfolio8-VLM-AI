@@ -165,8 +165,12 @@ class TalkMode(BaseMode):
             if has_new_alert:
                 # alert 消費の高水位を更新（二重展開防止）。VLM nudge は沈黙 backoff と直交。
                 self.state["_vlm_alerts_consumed_at"] = now
+                # Bug-C2: 最新 alert のナレーション本文を nudge に同梱し、
+                # 「画面が変わった」という事実だけでなく「何に変わったか」を直接渡す。
+                newest = self.llm.newest_vlm_alert()
+                snippet = (newest[1] or "").strip()[:100] if newest else ""
                 await self._process_idle_input(
-                    "[内部: 画面に新しい変化があった - 自然にリアクションして]",
+                    self._build_vlm_nudge_text(snippet),
                     is_silence_nudge=False,
                 )
             else:
@@ -181,6 +185,18 @@ class TalkMode(BaseMode):
                     continue
                 self._last_nudge_fire_ts = now
                 await self._process_idle_input("…", is_silence_nudge=True)
+
+    @staticmethod
+    def _build_vlm_nudge_text(snippet: str) -> str:
+        """VLM nudge の入力テキストを構築（Bug-C2）。
+
+        注意: 全角ダッシュ「—」を含めないこと — base_mode の内部 nudge RAG-query 分岐
+        （input_text.split("—")）と督促 regex（[内部: 期限超過 …—…]）の専用記号のため。
+        """
+        snippet = (snippet or "").replace("—", "-").strip()
+        if snippet:
+            return f"[内部: 画面に新しい変化があった - 最新の画面: {snippet} - これに自然にリアクションして]"
+        return "[内部: 画面に新しい変化があった - 自然にリアクションして]"
 
     async def _process_idle_input(self, input_text: str, is_silence_nudge: bool = False):
         """無言時の自発発話処理（旧 _process_ellipsis）。

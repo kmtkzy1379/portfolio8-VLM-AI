@@ -516,9 +516,22 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         except Exception as e:
             logger.warning("append_vlm_alert failed: %s", e)
 
-    def has_unseen_vlm_alerts(self, since_ts: float) -> bool:
-        """since_ts 以降の VLM alert が存在するか（idle ellipsis loop 用）。"""
-        return any(ts > since_ts for ts, _, _ in self._vlm_alerts)
+    def has_unseen_vlm_alerts(self, since_ts: float, max_age_sec: float = 30.0) -> bool:
+        """since_ts 以降の VLM alert が存在するか（idle ellipsis loop 用）。
+
+        Bug-C2: max_age_sec を超えた古い alert には反応しない（鮮度ゲート）。
+        発話中などで消費が遅れた alert に今さら反応すると「前の画面」を語る事故になる。
+        古い alert も vlm_alerts_block には年齢ラベル付きで残る（情報としては見える）。
+        """
+        now = time.time()
+        return any(
+            ts > since_ts and (now - ts) <= max_age_sec
+            for ts, _, _ in self._vlm_alerts
+        )
+
+    def newest_vlm_alert(self):
+        """最新の VLM alert (ts, narration, tag) を返す（無ければ None）。Bug-C2 用。"""
+        return self._vlm_alerts[-1] if self._vlm_alerts else None
 
     @staticmethod
     def _format_alert_age(seconds: float) -> str:
@@ -812,8 +825,9 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             alert_lines = "\n".join(self._format_alert(a) for a in self._vlm_alerts)
             vlm_alerts_block = (
                 "\n[Vision Alerts (recent)]:\n"
-                "以下は直近の画面変化通知です。タイムスタンプを見て、新しい変化なら自然に触れて、\n"
-                "古いものは無視してください（数秒前なら触れる、1分以上前なら基本スルー）。\n"
+                "以下は直近の画面変化通知です。リアクションしてよいのは一番下（最新）の1件だけ。\n"
+                "上の行は過去の画面で、今はもう映っていない — 最新行と矛盾する古い内容を\n"
+                "「今のこと」として話さない（数秒前なら触れる、1分以上前なら基本スルー）。\n"
                 f"{alert_lines}\n"
             )
 
