@@ -530,6 +530,8 @@ class TalkMode(BaseMode):
         Fix-6 P1-b: is_internal_nudge を process_input に伝搬する。
         """
         try:
+            # Fix-G1 の [fulfill] 記録は base_mode の pipeline 末尾で行う
+            # （process_input を直接呼ぶ全経路をカバーするため。ここでは記録しない）。
             await self.process_input(input_text, is_internal_nudge=is_internal_nudge)
         except asyncio.CancelledError:
             pass

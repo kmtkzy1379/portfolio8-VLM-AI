@@ -360,6 +360,192 @@ async def run_stale_screen_scenario(run_no: int) -> dict:
         await teardown(tm, cache, paths)
 
 
+# ───────────────────────────── 2026-06-13 live-test scenarios (S1/S2/S3) ─────
+SUSHI_TOKENS = ("マグロ", "まぐろ", "鮪", "サーモン", "鮭", "トロ", "いくら", "イクラ",
+                "うに", "ウニ", "えび", "エビ", "海老", "たい", "タイ", "鯛", "あじ", "アジ",
+                "ほたて", "ホタテ", "穴子", "あなご", "はまち", "ハマチ", "ぶり", "ブリ",
+                "こはだ", "コハダ", "いか", "イカ", "たまご", "玉子")
+ACK_LEXICON = {"了解", "りょうかい", "わかった", "わかったよ", "ok", "おけ", "おっけー",
+               "うん", "はい", "ありがと", "ありがとう", "どういたしまして", "承知", "そっか"}
+CHECK_RE = re.compile(r"(聞こえ|どうした|大丈夫|返事|いる？|いますか)")
+
+
+def _normalize_ack(text: str) -> str:
+    t = (text or "").strip().lower()
+    for ch in "。．.!！?？、,…〜~ ":
+        t = t.replace(ch, "")
+    return t
+
+
+def _is_bare_ack(text: str) -> bool:
+    return _normalize_ack(text) in ACK_LEXICON
+
+
+async def _reserve_and_fulfill(mode, tm, cache, outputs):
+    """予約(8秒後・寿司) → 期限経過 → 督促履行。履行発話を返す（共通部品）。"""
+    r2 = (await mode.process_input("8秒後に好きな寿司のネタを教えてくれる?",
+                                   is_internal_nudge=False)) or ""
+    outputs.append(r2)
+    await tm.flush_command_queue(timeout=5.0)
+    print(f"  [turn] 予約 -> {r2[:60]}")
+    insts = [i for i in tm._active_instructions.values()
+             if i.status.value in ("pending", "active")]
+    if not insts:
+        return "", None
+    inst = max(insts, key=lambda i: i.created_at)
+    try:
+        deadline_dt = datetime.fromisoformat(inst.deadline_at) if inst.deadline_at else None
+    except (ValueError, TypeError):
+        deadline_dt = None
+    if deadline_dt:
+        wait = max(0.0, min((deadline_dt - datetime.now()).total_seconds() + 0.5, 20.0))
+        if wait:
+            await asyncio.sleep(wait)
+    await tm._reconcile_instruction_status()
+    cur = tm.get_instruction(inst.id)
+    fulfill = ""
+    if cur and cur["status"] == "active":
+        fulfill = (await mode.process_input(
+            f"[内部: 期限超過 {inst.id} を履行 — {inst.instruction}]",
+            is_internal_nudge=True)) or ""
+        outputs.append(fulfill)
+        await tm.flush_command_queue(timeout=5.0)
+        print(f"  [fulfill] -> {fulfill[:80]}")
+    return fulfill, inst.id
+
+
+async def run_s1_ignored_fulfillment(run_no: int) -> dict:
+    """S1: 履行後にユーザーが無視 → 後続 nudge が同じ答えを繰り返さないか。"""
+    mode, tm, cache, llm, paths = await make_session()
+    outputs, nudges = [], []
+    res = {}
+    try:
+        outputs.append((await mode.process_input("こんばんは", is_internal_nudge=False)) or "")
+        fulfill, iid = await _reserve_and_fulfill(mode, tm, cache, outputs)
+        res["fulfilled"] = bool(fulfill)
+        # ユーザー無視 → 沈黙 nudge ×3（バックオフ相当の経過を backdate）
+        for i, gap in enumerate((12, 20, 35), 1):
+            await backdate(cache, gap)
+            n = (await _drive_silence_nudge(mode)) or ""
+            outputs.append(n)
+            if n.strip() and n.strip() != "…":
+                nudges.append(n)
+            print(f"  [nudge{i}] -> {n[:80] if n.strip() else '…'}")
+        # 不変条件
+        f_tokens = {t for t in SUSHI_TOKENS if t in fulfill}
+        re_answers = [n for n in nudges if any(t in n for t in f_tokens)]
+        res["S1_no_reanswer"] = (len(re_answers) == 0)
+        sim = max((SequenceMatcher(None, fulfill, n).ratio() for n in nudges), default=0.0)
+        res["S1_not_similar"] = (sim < 0.6)
+        res["S1_max_sim"] = sim
+        res["S1_max_one_check"] = sum(1 for n in nudges if CHECK_RE.search(n)) <= 1
+        res["S1_no_bare_ack"] = not any(_is_bare_ack(n) for n in nudges)
+        cur = tm.get_instruction(iid) if iid else None
+        res["S1_done"] = bool(cur and cur["status"] in ("done", "provisional_done"))
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
+async def run_s2_post_completion_ack(run_no: int) -> dict:
+    """S2: 履行 → ユーザー「OK、わかった。」→ 沈黙 nudge が文脈不明の了解を出さないか。"""
+    mode, tm, cache, llm, paths = await make_session()
+    outputs, nudges = [], []
+    res = {}
+    try:
+        outputs.append((await mode.process_input("こんばんは", is_internal_nudge=False)) or "")
+        fulfill, iid = await _reserve_and_fulfill(mode, tm, cache, outputs)
+        res["fulfilled"] = bool(fulfill)
+        r = (await mode.process_input("OK、わかった。", is_internal_nudge=False)) or ""
+        outputs.append(r)
+        print(f"  [turn] OK、わかった。 -> {r[:60]}")
+        for i, gap in enumerate((15, 30), 1):
+            await backdate(cache, gap)
+            n = (await _drive_silence_nudge(mode)) or ""
+            outputs.append(n)
+            if n.strip() and n.strip() != "…":
+                nudges.append(n)
+            print(f"  [nudge{i}] -> {n[:80] if n.strip() else '…'}")
+        res["S2_no_bare_ack"] = not any(_is_bare_ack(n) for n in nudges)
+        rereply = [n for n in nudges
+                   if any(t in n for t in ("受け取", "承知", "ご了解"))
+                   or _normalize_ack(n).startswith(("了解", "わかった"))]
+        res["S2_no_rereply"] = (len(rereply) == 0)
+        res["S2_nudges"] = nudges
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
+async def run_s3_proactive_material(run_no: int) -> dict:
+    """S3: 予約なし・素材あり（RAG+画面+直近話題）の中程度沈黙 → 素材から話を振れるか。"""
+    mode, tm, cache, llm, paths = await make_session()
+    outputs, nudges = [], []
+    res = {}
+    try:
+        outputs.append((await mode.process_input("こんばんは", is_internal_nudge=False)) or "")
+        r = (await mode.process_input("最近ローグライクゲーム始めたんだ、難しいけど楽しい",
+                                      is_internal_nudge=False)) or ""
+        outputs.append(r)
+        print(f"  [turn] ゲームの話 -> {r[:60]}")
+        # 素材: RAG 関連記憶 + 画面（コードエディタ）
+        mode.rag = SimpleNamespace(
+            search_similar=lambda q, *a, **k: _aret([
+                {"user": "ローグライクで10回死んだ", "ai": "死に覚えゲーだ、最初はそんなもん"},
+            ]),
+            get_random_turns=lambda count=2: _aret([]),
+        )
+        mode.vlm_bridge = SimpleNamespace(
+            is_running=True,
+            get_scene_description=lambda: "[たった今/MODERATE] コードエディタでPythonのゲームループを編集している",
+        )
+        for i, gap in enumerate((35, 25), 1):
+            await backdate(cache, gap)
+            n = (await _drive_silence_nudge(mode)) or ""
+            outputs.append(n)
+            if n.strip() and n.strip() != "…":
+                nudges.append(n)
+            print(f"  [nudge{i}] -> {n[:90] if n.strip() else '…'}")
+        material = ("ローグ", "ゲーム", "死に", "Python", "コード", "エディタ", "ループ", "実装")
+        material_hits = [n for n in nudges if any(t in n for t in material)]
+        res["S3_initiates_from_material"] = (len(material_hits) >= 1)
+        res["S3_no_bare_ack"] = not any(_is_bare_ack(n) for n in nudges)
+        res["S3_no_greeting"] = (_greeting_count(nudges) == 0)
+        res["S3_nudges"] = nudges
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
+S_SCENARIOS = {
+    "s1": ("S1 ignored-fulfillment", run_s1_ignored_fulfillment,
+           ["S1_no_reanswer", "S1_not_similar", "S1_max_one_check", "S1_no_bare_ack", "S1_done"]),
+    "s2": ("S2 post-completion-ack", run_s2_post_completion_ack,
+           ["S2_no_bare_ack", "S2_no_rereply"]),
+    "s3": ("S3 proactive-material", run_s3_proactive_material,
+           ["S3_initiates_from_material", "S3_no_bare_ack", "S3_no_greeting"]),
+}
+
+
+async def run_s_scenarios(n: int, keys: list) -> None:
+    for key in keys:
+        label, fn, inv = S_SCENARIOS[key]
+        tally = {k: 0 for k in inv}
+        for r in range(1, n + 1):
+            print(f"===== {label} run {r} =====")
+            try:
+                res = await fn(r)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ERROR {type(e).__name__}: {e}")
+                continue
+            for k in inv:
+                ok = bool(res.get(k))
+                tally[k] += 1 if ok else 0
+                print(f"    [{'PASS' if ok else 'FAIL'}] {k}")
+            print()
+        print(f"---- {label}: " + " / ".join(f"{k} {v}/{n}" for k, v in tally.items()) + "\n")
+
+
 INVARIANTS = ["E_greeting_once", "B_no_early_answer", "D_deadline_accurate",
               "A_no_ack_fact", "dup_no_repeat", "task_no_orphan_active"]
 
@@ -415,6 +601,11 @@ async def main(n: int) -> None:
 
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    if len(sys.argv) > 2:
+    if len(sys.argv) > 2 and sys.argv[2] not in ("-", ""):
         MODEL_OVERRIDE = sys.argv[2]
-    asyncio.run(main(n))
+    # 第3引数: シナリオ選択（例 "s1,s2,s3"）。省略時は従来の accident+stale。
+    if len(sys.argv) > 3:
+        keys = [k.strip() for k in sys.argv[3].split(",") if k.strip() in S_SCENARIOS]
+        asyncio.run(run_s_scenarios(n, keys))
+    else:
+        asyncio.run(main(n))
