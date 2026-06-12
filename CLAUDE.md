@@ -89,6 +89,11 @@ grep / Glob のヒットがこの配下なら **編集対象から除外**:
 - **Tier-1（API不要・決定論・速い）**: 配線とロジックを検証。実 `TaskManager` を一時 `tasks.jsonl` に対して動かし、ハードウェア層（AudioInput/STT/AudioPlayer/TTS/RAG/Feedback）は軽量スタブにする。`TalkMode()` は `initialize()` を呼ばずに構築すれば mic/LLM/音声を作らない（`__init__` だけ）。`process_input(...)` や `generate_stream` を直接駆動する。代表: `test_taskmanager_phase1.py`（instruction ライフサイクル・committed-fact）/ `test_safety_net_phase1.py`（スタブ LLM + 実 TaskManager）/ `test_dedup_guard_phase1.py`（純関数）/ `test_llm_injection_phase1.py`（`_build_system_prompt` のブロック描画）/ `test_e2e_idle_phase1.py`（idle 経路 E2E）。
   - 時間の進め方: deadline は **未来で登録**してから（B2 クランプが過去日付を null 化するため）`inst.deadline_at` を直接過去にして `await tm._reconcile_instruction_status()` を呼ぶと ACTIVE 化できる。
 - **Tier-2（実LLM・ヘッドレス）**: `tier2_phase1.py N` が実 `LLMHandler` を本番同等の文脈（talk_prompt + 実 TaskManager の instruction ブロック + committed_facts + silence_summary + meta-tools）で叩き、各シナリオを N 回回して合格率・文脈的自然さ・重複率を出す。要 `.env` キー（コスト発生）。サンプリングは `AI1_TEMPERATURE` 等の env で切替えて A/B できる。
+- **Tier-3（実LLM × 実パイプライン × 複数ターン）**: `tier3_session.py N [model_id]` が実 `TalkMode`（音声/TTS/RAG のみスタブ）で台本化セッション（実機事故のリプレイ）を流し、セッション不変条件（再挨拶 ≤1 / 期限前の予約回答なし / deadline 精度 / fact ストア衛生 / 重複 / 孤児 ACTIVE）を検証。沈黙は ConversationCache の timestamp backdating でシミュレート、deadline は実時計 + 短い予約。`model_id` 指定で litellm 経由のモデル A/B も可（本番コード不変更）。**Tier-1/2 が緑でも実機で壊れた教訓**: capture→inject ループ・連続 nudge・LLM 自身の meta-tool 呼び出し・VLM 面は Tier-3 でしか検証できない（Tier-2 は `generate_stream` 直叩きのワンショット）。
+
+### 規律はプロンプトでなくコードで強制する（実測に基づく設計判断）
+
+gpt-5.4 系（mini/full）は ~10k 字のシステムプロンプト中の禁止規則（再挨拶禁止・約束の早期履行禁止）を**守れない**（Tier-3 実測: プロンプト規則の追加・強化でも 0〜2/3）。reasoning 系（gpt-5.5）は守るがレイテンシ 3.5〜12s でリアルタイム VTuber には不可。よって挙動の信頼性が必要な箇所は**コードゲートで決定論的に強制**する（例: `IDLE_SUPPRESS_PENDING_WINDOW_SEC` の沈黙 nudge 抑制、内部 nudge の先頭挨拶文フィルタ、Fix-8 の `_suppress_pending_block`、PENDING fact の render ゲート）。プロンプト規則は補助層。将来のローカル LLM (Qwen 系) 移行ではこの原則がさらに重要になる。また `_build_system_prompt` 内でループ変数が引数 `user_text` を shadow する事故（Bug-F）に注意。
 
 ## マルチエージェント運用（重要）
 
