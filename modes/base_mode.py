@@ -229,6 +229,12 @@ class BaseMode(ABC):
             cands = self.task_manager.get_active_instructions_for_prompt()
             if len(cands) != 1:
                 return
+            # Bug-A gate: 期限未到来 (derived PENDING) の予約には「答え」がまだ存在しない。
+            # 予約受理の返事（「うん、30秒後に答えるね」）や待機中の雑談を fact として
+            # コミットしない（ライブで answer_text が了解発話に汚染された事故の根本対策）。
+            # 期限到来 (derived=active) の回答のみ帰属させる。督促 regex 経路は上で処理済み。
+            if cands[0].get("derived_status") != "active":
+                return
             iid = cands[0]["id"]
             instruction_text = cands[0]["instruction"]
         if not instruction_text:
