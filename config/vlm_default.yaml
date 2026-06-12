@@ -91,8 +91,10 @@ aggregation:
   min_entity_lifetime: 15   # min frames_alive before reporting entity (12→15: フリッカー抑制)
 
 narration:
-  model: "groq/meta-llama/llama-4-scout-17b-16e-instruct"
-  fallback_model: "groq/llama-3.3-70b-versatile"
+  # Fix-H: 小型 llama-4-scout は描写が抽象的（実機フィードバック）→ gemini-3.5-flash に切替。
+  # fallback は従来 primary の scout（マルチモーダル必須 — llama-3.3 は画像不可なので外した）。
+  model: "gemini/gemini-3.5-flash"
+  fallback_model: "groq/meta-llama/llama-4-scout-17b-16e-instruct"
   min_interval_seconds: 1.0
   max_context_entries: 3
   max_crops: 2

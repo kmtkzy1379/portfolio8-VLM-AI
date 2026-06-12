@@ -100,8 +100,11 @@ def run_c2() -> None:
     check("no em-dash (RAG-query/督促 regex と衝突しない)", "—" not in t)
     t2 = TalkMode._build_vlm_nudge_text("ダッシュ—入り")
     check("em-dash in snippet sanitized", "—" not in t2)
-    check("empty snippet -> legacy text",
-          TalkMode._build_vlm_nudge_text("") == "[内部: 画面に新しい変化があった - 自然にリアクションして]")
+    check("optional-reaction wording present (Fix-H)",
+          "必須ではない" in t and "実況・報告はしない" in t)
+    check("empty snippet -> still optional-reaction text",
+          TalkMode._build_vlm_nudge_text("").startswith("[内部: 画面に新しい変化があった")
+          and "必須ではない" in TalkMode._build_vlm_nudge_text(""))
 
     print("\n--- Bug-C2: alert freshness gate + newest accessor ---")
     llm = LLMHandler()
