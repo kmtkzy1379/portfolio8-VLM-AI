@@ -116,12 +116,12 @@ META_TOOLS = [
                 "短期予約・約束・期限付きアクションを登録する。【限定用途】: "
                 "ユーザーが明示的に約束を求めた瞬間、自分が「○○までに必ず X する」と決めた瞬間、"
                 "ユーザーが「これだけは忘れずに」と言った瞬間にのみ呼ぶ。"
-                "【deadline は絶対時刻 (ISO 8601) のみ受け付ける】。"
-                "ユーザーが「2 ターン後」「3 ターンしてから」のようなターン数指定をしてきた場合、"
-                "自分は会話ターンを正確に数えられる保証は無いので、"
-                "(i) 直近の会話ペース (recent_context の各ターンに付いている timestamp の間隔) から "
-                "時間に変換して deadline_at を計算する、または "
-                "(ii) 確信が無ければユーザーに「何秒後がいいですか？」と確認してから登録すること。"
+                "【期限指定は delay_seconds（今から何秒後か）を最優先で使う】。"
+                "「30秒後」→ delay_seconds=30、「2分後」→ delay_seconds=120。"
+                "「2 ターン後」のようなターン数指定は、直近の会話ペース"
+                "（recent_context の timestamp 間隔）から秒数に換算して delay_seconds で渡すか、"
+                "確信が無ければユーザーに「何秒後がいいですか？」と確認してから登録する。"
+                "deadline_at（絶対時刻）はユーザーが時計時刻を明示したときだけ使う。"
                 "【雑談中の思いつき、AI2 の参考意見、現在方針 (goal_short) の更新には使わない】。"
                 "コロコロ呼ぶと expired で消えていくので、本当に「忘れたくないこと」だけに絞る。"
             ),
@@ -136,14 +136,21 @@ META_TOOLS = [
                         "type": "string",
                         "description": "なぜ予約するか（1 文）"
                     },
+                    "delay_seconds": {
+                        "type": "number",
+                        "description": (
+                            "（強く推奨）今から何秒後が期限か（例: 「30秒後」→ 30、「2分後」→ 120）。"
+                            "アプリ側が now+delay_seconds を計算するので時刻計算ミスが起きない。"
+                            "deadline_at と両方指定された場合は delay_seconds が優先される。"
+                        )
+                    },
                     "deadline_at": {
                         "type": "string",
                         "description": (
-                            "（任意、ただし強く推奨）ISO 8601 形式の絶対時刻のみ"
-                            "（例: '2026-05-17T13:01:30'、tz naive）。"
-                            "相対時間（『30秒後』『+30s』『2 ターン後』等）は禁止。"
-                            "ユーザー指定が相対の場合は、自分で現在時刻に加算して絶対時刻に変換すること。"
-                            "未指定の場合は 5 分後に自動 expire する。"
+                            "（任意）ISO 8601 形式の絶対時刻（例: '2026-05-17T13:01:30'、tz naive）。"
+                            "ユーザーが時計時刻（『13時に』等）を明示したときのみ使う。"
+                            "相対指定（『30秒後』等）は deadline_at ではなく delay_seconds を使うこと。"
+                            "どちらも未指定の場合は 5 分後に自動 expire する。"
                         )
                     }
                 },
@@ -824,8 +831,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         _wd = ["月", "火", "水", "木", "金", "土", "日"][now_dt.weekday()]
         now_block = (
             f"\n[現在時刻]: {now_dt.strftime('%Y-%m-%d')}（{_wd}）{now_dt.strftime('%H:%M:%S')}\n"
-            f"  ※ deadline_at は必ずこの日付を基準に。今は {now_dt.strftime('%Y-%m-%dT%H:%M:%S')}。"
-            "「30秒後」ならこれに 30 秒足した ISO 文字列にすること。\n"
+            "  ※ 「30秒後」のような相対指定の予約は delay_seconds=30 を使う（自分で時刻を足さない）。"
+            "deadline_at（絶対時刻）はユーザーが時計時刻を明示したときのみ、この日付を基準に。\n"
         )
 
         # Step 1.5: active_instruction の注入
@@ -1051,6 +1058,8 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
                 "instruction": (arguments.get("instruction") or "").strip(),
                 "reason": arguments.get("reason", ""),
                 "deadline_at": arguments.get("deadline_at"),
+                # Bug-D: 相対指定はサーバ側で now+delay を計算（LLM の時刻計算ミスを排除）
+                "delay_seconds": arguments.get("delay_seconds"),
                 "created_by": "ai1",
             })
             return "予約を登録しました"

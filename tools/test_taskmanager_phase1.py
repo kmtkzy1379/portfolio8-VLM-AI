@@ -301,6 +301,54 @@ async def test_facet_rotation() -> None:
         await _teardown(tm, path)
 
 
+async def test_delay_seconds() -> None:
+    """Fix-D: 相対指定 delay_seconds はサーバ側で now+delay を計算し absolute より優先する。"""
+    print("\n--- Fix-D: delay_seconds (server-side relative deadline) ---")
+    tm, path = await _make_tm()
+    try:
+        now = datetime.now()
+        # 1) delay のみ → now+30 近傍・PENDING（即 ACTIVE しない）
+        tm.enqueue_command_nowait({
+            "kind": "set_active_instruction", "instruction": "好きな魚を答える",
+            "reason": "t", "created_by": "ai1", "delay_seconds": 30,
+        })
+        await tm.flush_command_queue()
+        inst = max(tm._active_instructions.values(), key=lambda i: i.created_at)
+        dl = datetime.fromisoformat(inst.deadline_at)
+        delta = (dl - now).total_seconds()
+        check("delay=30 -> deadline ~ now+30", 28 <= delta <= 32, f"delta={delta:.1f}s")
+        check("delay=30 -> stays PENDING", inst.status == InstructionStatus.PENDING)
+
+        # 2) delay + 誤った絶対値（+58s）→ delay が勝つ
+        tm.enqueue_command_nowait({
+            "kind": "set_active_instruction", "instruction": "好きな色を答える",
+            "reason": "t", "created_by": "ai1", "delay_seconds": 10,
+            "deadline_at": iso(now + timedelta(seconds=58)),
+        })
+        await tm.flush_command_queue()
+        inst2 = [i for i in tm._active_instructions.values() if i.instruction == "好きな色を答える"][0]
+        d2 = (datetime.fromisoformat(inst2.deadline_at) - now).total_seconds()
+        check("delay=10 beats wrong absolute(+58s)", 8 <= d2 <= 13, f"delta={d2:.1f}s")
+
+        # 3) 不正値は無視して absolute fallback（例外なし）
+        for bad in ("abc", -5, 0, 90000):
+            tm.enqueue_command_nowait({
+                "kind": "set_active_instruction", "instruction": f"不正delay{bad}",
+                "reason": "t", "created_by": "ai1", "delay_seconds": bad,
+                "deadline_at": iso(now + timedelta(seconds=60)),
+            })
+        await tm.flush_command_queue()
+        bads = [i for i in tm._active_instructions.values() if str(i.instruction).startswith("不正delay")]
+        ok_fallback = all(
+            55 <= (datetime.fromisoformat(i.deadline_at) - now).total_seconds() <= 65
+            for i in bads
+        )
+        check("invalid delay values ignored -> absolute fallback, no exception",
+              len(bads) == 4 and ok_fallback, f"n={len(bads)}")
+    finally:
+        await _teardown(tm, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
@@ -311,6 +359,7 @@ async def main() -> None:
     await test_capture_maybe_commit_fact()
     await test_release_facts_on_supersede()
     await test_facet_rotation()
+    await test_delay_seconds()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)

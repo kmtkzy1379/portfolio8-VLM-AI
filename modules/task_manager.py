@@ -1123,6 +1123,21 @@ class TaskManager:
             task_logger.warning("[Instruction] set: empty instruction, skip")
             return
 
+        # Bug-D: 相対指定 (delay_seconds) はサーバ側で now+delay を計算して優先する。
+        # LLM の絶対時刻計算ミス（「30秒後」→ +58s や過去時刻）をクラスごと排除する。
+        # 不正値は無視して absolute fallback（既存の parse 防衛 / B2 クランプはそのまま生きる）。
+        delay = cmd.get("delay_seconds")
+        if delay is not None:
+            try:
+                d = float(delay)
+                if 0.0 < d <= 86400.0:
+                    deadline_at = (datetime.now() + timedelta(seconds=d)).isoformat()
+                    task_logger.info(
+                        "[Instruction] delay_seconds=%.0f -> deadline_at=%s", d, deadline_at,
+                    )
+            except (ValueError, TypeError):
+                pass
+
         # deadline_at の parse 防衛
         if deadline_at:
             try:
