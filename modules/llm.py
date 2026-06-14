@@ -5,6 +5,7 @@ import os
 import time
 from collections import deque
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional
 from groq import AsyncGroq
 from openai import AsyncOpenAI
@@ -204,6 +205,33 @@ META_TOOLS = [
 ]
 
 
+class _LiteLLMShim:
+    """OpenAI クライアント互換の薄い shim。litellm 経由で任意プロバイダのモデルを叩く
+    （NUDGE_MODEL 用）。drop_params で未対応パラメータは自動で落ち、reasoning 系の
+    temperature 拒否は剥がして1回リトライ。stream/非stream とも OpenAI 互換レスポンスを返す。"""
+
+    def __init__(self, model: str):
+        self._model = model
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kw):
+        import litellm
+        litellm.drop_params = True
+        litellm.suppress_debug_info = True
+        kw["model"] = self._model
+        if "max_completion_tokens" in kw:
+            kw["max_tokens"] = kw.pop("max_completion_tokens")
+        try:
+            return await litellm.acompletion(**kw)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if "temperature" in msg or "Unsupported value" in msg or "not support" in msg:
+                for p in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                    kw.pop(p, None)
+                return await litellm.acompletion(**kw)
+            raise
+
+
 class LLMHandler:
     def __init__(self):
         self.model = Config.AI1_MODEL
@@ -225,6 +253,11 @@ class LLMHandler:
         self._fallback_client = AsyncGroq(api_key=Config.GROQ_API_KEY)
         self._fallback_model = "llama-3.3-70b-versatile"
         self._fallback_max_tokens = 256
+
+        # NUDGE_MODEL: 自律発話(沈黙 "…" nudge)ターンだけ別の賢いモデルへ。空なら無効。
+        self._nudge_model = (Config.NUDGE_MODEL or "").strip()
+        self._nudge_client = _LiteLLMShim(self._nudge_model) if self._nudge_model else None
+        self._primary_saved = None  # swap 中の退避先
 
         logger.info(
             "LLMHandler: primary=%s (%s), fallback=groq (%s)",
@@ -1301,6 +1334,29 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         return f"不明なツール: {tool_name}"
 
+    def _maybe_swap_to_nudge_model(self, is_internal_nudge: bool, user_text: str) -> bool:
+        """自律発話(沈黙 "…" nudge)ターンなら、生成に使う client/model を NUDGE_MODEL に差し替える。
+        督促 "[内部: 期限超過…]" / VLM "[内部: 画面…]" / 通常ターンは対象外（速い AI1 のまま）。"""
+        if not (self._nudge_client and is_internal_nudge and user_text.strip() == "…"):
+            return False
+        self._primary_saved = (self.client, self.model, self._tokens_param,
+                               self._fallback_client, self._fallback_model)
+        self.client = self._nudge_client
+        self.model = self._nudge_model
+        self._tokens_param = "max_tokens"  # litellm は max_tokens
+        # fallback も nudge モデルに（groq 退避で自律発話の質が落ちないように）
+        self._fallback_client = self._nudge_client
+        self._fallback_model = self._nudge_model
+        inject_logger.debug("[Nudge] model swap -> %s (autonomous-speech turn)", self._nudge_model)
+        return True
+
+    def _restore_primary_model(self) -> None:
+        if self._primary_saved is None:
+            return
+        (self.client, self.model, self._tokens_param,
+         self._fallback_client, self._fallback_model) = self._primary_saved
+        self._primary_saved = None
+
     def _collapse_silence_pairs(self) -> None:
         """history 配列から連続する user='…' / assistant='…' ペアを完全除去する。
 
@@ -1406,6 +1462,9 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         self._safe_trim_history()
 
+        # NUDGE_MODEL: 自律発話ターンだけ賢いモデルへ差し替え（finally で必ず復元）。
+        _nudge_swapped = self._maybe_swap_to_nudge_model(is_internal_nudge, user_text)
+
         try:
             # Phase 3: tool_call対応の2段階生成
             # VLM bridge が接続+running なら VISION_TOOLS を有効化する。
@@ -1460,6 +1519,10 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
             # Fix-6 P1-d: 例外時も内部 nudge の history を確実に rollback
             if is_internal_nudge and history_snapshot_len is not None:
                 self.history = self.history[:history_snapshot_len]
+        finally:
+            # NUDGE_MODEL の差し替えを必ず元に戻す（次の realtime 応答は速い AI1 のまま）
+            if _nudge_swapped:
+                self._restore_primary_model()
 
     async def _tool_augmented_stream(self):
         """tool_call判定 → 必要なら実行 → ストリーミング応答

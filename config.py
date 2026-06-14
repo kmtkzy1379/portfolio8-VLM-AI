@@ -201,6 +201,11 @@ class Config:
     # mini が文脈材料を使い切れず「…」に倒れるため、ペルソナ/FEP を簡素化し直近会話・RAG・
     # 画面・タスク・自律発話判断を前面に出す。A/B 用に env で off にもできる。
     SILENCE_LEAN_PROMPT = os.getenv("SILENCE_LEAN_PROMPT", "true").lower() == "true"
+    # 自律的発話（沈黙 "…" nudge）ターンだけ、別の賢いモデルで生成する。非同期で遅延が
+    # 許されるターンなので、リアルタイム応答は速い AI1 のまま、「新しい話題を出すか/黙るか」の
+    # 高度な判断だけ強いモデルに委ねられる（実測: 自律発話 mini 0/3 → gpt-5.4 2/2）。
+    # 空なら無効（AI1 と同じモデル）。例: "gpt-5.4" / "anthropic/claude-sonnet-4-6"（litellm 経由）。
+    NUDGE_MODEL = os.getenv("NUDGE_MODEL", "")
     # 履行後の rigid な「質問のみ/沈黙」ゲート（Fix-G5）。[fulfill] が沈黙中ずっと残り、
     # 履行後の別話題への自発発話までミュートしていた（2026-06-14）。軽量プロンプトの
     # 「再回答禁止」情報に委ねるため既定 off。再回答が再発するなら true に戻す。
