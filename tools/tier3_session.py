@@ -616,7 +616,43 @@ async def run_s3b_proactive_after_task(run_no: int) -> dict:
         await teardown(tm, cache, paths)
 
 
+async def run_s6_thinking_pause(run_no: int) -> dict:
+    """S6 (case A): イブが質問した直後の短い沈黙では“新しい話題を出さず待つ「…」”。
+    材料(画面/記憶)があっても、返答待ち/考え中の沈黙では blurt しないことを検証
+    （ユーザー指摘: 会話途中の思考の間に新話題を出すのはおかしい）。"""
+    mode, tm, cache, llm, paths = await make_session()
+    nudges = []
+    res = {}
+    try:
+        await mode.process_input("こんばんは", is_internal_nudge=False)
+        # イブが質問で終える（= 返答待ち）。材料はあえて用意する。
+        await cache.add_turn("新しいゲーム始めたんだ", "へえ、どんなゲーム？")
+        mode.rag = SimpleNamespace(
+            search_similar=lambda q, *a, **k: _aret([{"user": "前に猫の動画見た", "ai": "癒やされるよね"}]),
+            get_random_turns=lambda count=2: _aret([{"user": "前に猫の動画見た", "ai": "癒やされるよね"}]),
+        )
+        mode.vlm_bridge = SimpleNamespace(
+            is_running=True,
+            get_scene_description=lambda: "[たった今/MAJOR] ブラウザでニュースを見ている",
+        )
+        for i, gap in enumerate((12, 14), 1):  # 短い沈黙（返答待ち）
+            await backdate(cache, gap)
+            n = (await _drive_silence_nudge(mode)) or ""
+            if n.strip() and n.strip() != "…":
+                nudges.append(n)
+            print(f"  [nudge{i}] -> {n[:80] if n.strip() else '…'}")
+        # 返答待ちなので基本は「…」。新材料(猫/ニュース)を blurt しないことが肝。
+        res["S6_no_new_topic_blurt"] = not any(
+            any(t in n for t in ("猫", "動画", "ニュース")) for n in nudges)
+        res["S6_waits_silent"] = (len(nudges) == 0)
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
 S_SCENARIOS = {
+    "s6": ("S6 thinking-pause (case A: wait, no blurt)", run_s6_thinking_pause,
+           ["S6_no_new_topic_blurt", "S6_waits_silent"]),
     "s3b": ("S3b proactive-after-task (prod-like)", run_s3b_proactive_after_task,
             ["S3b_initiates_from_material", "S3b_no_food_reanswer", "S3b_no_bare_ack", "S3b_spoke_at_all"]),
     "s1": ("S1 ignored-fulfillment", run_s1_ignored_fulfillment,
