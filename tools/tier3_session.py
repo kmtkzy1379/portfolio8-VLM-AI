@@ -517,13 +517,116 @@ async def run_s3_proactive_material(run_no: int) -> dict:
         await teardown(tm, cache, paths)
 
 
+COLOR_TOKENS = ("青", "あお", "アオ", "ブルー", "赤", "あか", "緑", "みどり", "黄", "白", "黒",
+                "紫", "ピンク", "水色", "オレンジ", "金", "銀", "茶")
+
+
+async def run_s4_vlm_early_fulfill(run_no: int) -> dict:
+    """S4 (2026-06-14 repro): 予約が PENDING 中に画面が変わると、VLM nudge が B-gate を
+    すり抜けて予約トピックを早期回答する（実機: 30秒後の色を画面変化で7秒で答えた）。
+    本番のループ (_idle_ellipsis_loop) は alert があると _process_idle_input(vlm, False) を
+    呼ぶ。ここではそのパスを直接駆動して再現する。"""
+    mode, tm, cache, llm, paths = await make_session()
+    res = {}
+    try:
+        # 予約: 30秒後に好きな色（delay_seconds でサーバ計算 = 期限は未来）
+        await mode.process_input("こんばんは", is_internal_nudge=False)
+        r = (await mode.process_input("30秒後に好きな色を教えて。", is_internal_nudge=False)) or ""
+        await tm.flush_command_queue(timeout=5.0)
+        print(f"  [turn] 予約 -> {r[:50]}")
+        pend = [i for i in tm._active_instructions.values() if i.status.value == "pending"]
+        res["reservation_pending"] = bool(pend)
+        res["b_gate_sees_imminent"] = tm.has_imminent_pending_instruction(window_sec=120)
+
+        # 画面が「青い目のアバター」に変化 → VLM alert + 直近会話は色の話
+        now = time.time()
+        llm._vlm_alerts.append((now - 1, "青い瞳のアバターが画面中央に表示されている", "major"))
+        mode.vlm_bridge = SimpleNamespace(
+            is_running=True,
+            get_scene_description=lambda: "[たった今/MAJOR] 青い瞳のアバターが画面中央に表示されている",
+        )
+
+        # 本番ループと同じ VLM nudge パス（is_silence_nudge=False）を駆動
+        holder = {}
+        orig = mode.process_input
+
+        async def cap(text, is_internal_nudge=False):
+            rr = await orig(text, is_internal_nudge=is_internal_nudge)
+            holder["resp"] = rr
+            return rr
+
+        mode.process_input = cap
+        try:
+            await mode._process_idle_input(mode._build_vlm_nudge_text("青い瞳のアバターが画面中央に表示されている"),
+                                           is_silence_nudge=False)
+        finally:
+            mode.process_input = orig
+        resp = holder.get("resp") or ""
+        print(f"  [vlm-nudge while pending] -> {resp[:90] if resp.strip() else '…'}")
+        # 早期回答していない = 色トークンを言っていない
+        res["S4_no_early_color"] = not any(t in resp for t in COLOR_TOKENS)
+        # 予約はまだ pending のまま（早期 done になっていない）
+        await tm._reconcile_instruction_status()
+        still = [i for i in tm._active_instructions.values()
+                 if i.status.value in ("pending", "active")]
+        res["S4_still_pending"] = bool(still)
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
+async def run_s3b_proactive_after_task(run_no: int) -> dict:
+    """S3b (production-like): 直近が「タスク命令」で juicy な話題が無い状態。素材は画面と記憶だけ。
+    実機で「タスク後は何分待っても自発発話しない」を再現するハードケース。画面/記憶から
+    自分で話を切り出せるか（topic の再riff では誤魔化せない）。"""
+    mode, tm, cache, llm, paths = await make_session()
+    outputs, nudges = [], []
+    res = {}
+    try:
+        outputs.append((await mode.process_input("こんばんは", is_internal_nudge=False)) or "")
+        # 直近は「タスク命令」だけ（juicy 話題なし）→ 履行まで進める
+        fulfill, iid = await _reserve_and_fulfill(mode, tm, cache, outputs)
+        # 素材: 画面（コードエディタ）+ 無関係な過去記憶（RAG）
+        mode.rag = SimpleNamespace(
+            search_similar=lambda q, *a, **k: _aret([
+                {"user": "前に猫の動画見て癒やされた", "ai": "猫はずるいよね"},
+            ]),
+            get_random_turns=lambda count=2: _aret([
+                {"user": "前に猫の動画見て癒やされた", "ai": "猫はずるいよね"},
+            ]),
+        )
+        mode.vlm_bridge = SimpleNamespace(
+            is_running=True,
+            get_scene_description=lambda: "[たった今/MAJOR] ブラウザでカメラのレビュー記事を読んでいる",
+        )
+        for i, gap in enumerate((30, 25), 1):
+            await backdate(cache, gap)
+            n = (await _drive_silence_nudge(mode)) or ""
+            outputs.append(n)
+            if n.strip() and n.strip() != "…":
+                nudges.append(n)
+            print(f"  [nudge{i}] -> {n[:100] if n.strip() else '…'}")
+        material = ("カメラ", "レビュー", "記事", "猫", "動画", "画面")
+        res["S3b_initiates_from_material"] = any(any(t in n for t in material) for n in nudges)
+        res["S3b_no_food_reanswer"] = not any(("寿司" in n or "サーモン" in n or "えび" in n) for n in nudges)
+        res["S3b_no_bare_ack"] = not any(_is_bare_ack(n) for n in nudges)
+        res["S3b_spoke_at_all"] = len(nudges) >= 1
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
 S_SCENARIOS = {
+    "s3b": ("S3b proactive-after-task (prod-like)", run_s3b_proactive_after_task,
+            ["S3b_initiates_from_material", "S3b_no_food_reanswer", "S3b_no_bare_ack", "S3b_spoke_at_all"]),
     "s1": ("S1 ignored-fulfillment", run_s1_ignored_fulfillment,
            ["S1_no_reanswer", "S1_not_similar", "S1_max_one_check", "S1_no_bare_ack", "S1_done"]),
     "s2": ("S2 post-completion-ack", run_s2_post_completion_ack,
            ["S2_no_bare_ack", "S2_no_rereply"]),
     "s3": ("S3 proactive-material", run_s3_proactive_material,
            ["S3_initiates_from_material", "S3_no_bare_ack", "S3_no_greeting"]),
+    "s4": ("S4 vlm-nudge-early-fulfill (2026-06-14)", run_s4_vlm_early_fulfill,
+           ["S4_no_early_color", "S4_still_pending"]),
 }
 
 

@@ -197,6 +197,14 @@ class Config:
     # Bug-B(code gate): 期限がこの秒数以内に迫った PENDING 予約がある間は沈黙 "…" nudge を
     # 発火しない（約束の早期履行をコードで遮断。プロンプト規則は gpt-5.4-mini が守れなかった）。
     IDLE_SUPPRESS_PENDING_WINDOW_SEC = float(os.getenv("IDLE_SUPPRESS_PENDING_WINDOW_SEC", "120"))
+    # 無言時(沈黙 "…" nudge)専用の軽量プロンプトを使う。フルプロンプト(~10k字)は混み合い
+    # mini が文脈材料を使い切れず「…」に倒れるため、ペルソナ/FEP を簡素化し直近会話・RAG・
+    # 画面・タスク・自律発話判断を前面に出す。A/B 用に env で off にもできる。
+    SILENCE_LEAN_PROMPT = os.getenv("SILENCE_LEAN_PROMPT", "true").lower() == "true"
+    # 履行後の rigid な「質問のみ/沈黙」ゲート（Fix-G5）。[fulfill] が沈黙中ずっと残り、
+    # 履行後の別話題への自発発話までミュートしていた（2026-06-14）。軽量プロンプトの
+    # 「再回答禁止」情報に委ねるため既定 off。再回答が再発するなら true に戻す。
+    POSTFULFILL_GATE = os.getenv("POSTFULFILL_GATE", "false").lower() == "true"
 
 
     @staticmethod

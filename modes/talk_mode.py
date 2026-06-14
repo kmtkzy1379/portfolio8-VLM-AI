@@ -282,6 +282,8 @@ class TalkMode(BaseMode):
                 category = "mid"
             else:
                 category = "long"
+            # 軽量無言プロンプト(_build_silence_prompt)に沈黙の深さを渡す（深いほど「…」寄り）。
+            self.llm.silence_category = category
 
             # A1: この沈黙ストリークで既に言ったことを LLM に見せる（反復防止）。
             self.llm.nudge_self_memory = list(self._nudge_spoken)

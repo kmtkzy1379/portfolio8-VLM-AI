@@ -577,6 +577,120 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
         tag_str = tag.upper() if tag else "ALERT"
         return f"[{age_str}/{tag_str}] {narration}"
 
+    def _build_silence_prompt(self) -> str:
+        """無言時(沈黙 "…" nudge)専用の軽量システムプロンプト（autonomous speech）。
+
+        フルプロンプト(~10k字)はペルソナ/FEP/ツール規則で混み合い、mini が文脈材料を
+        使い切れず「…」に倒れる（材料は注入されている — diag_silence_inject.py で確認済）。
+        ここではペルソナ/FEP を超簡易にし、直近会話・RAG・画面・気分・タスク・自律発話判断を
+        前面に出す。「話す/黙る」はモデルの選択（確率でなく文脈で決めさせる）。
+        フルプロンプトは触らない（通常ターン・督促・VLM nudge は従来どおり）。
+        安全性(Fix-6 history rollback / code gates)はプロンプト外で担保されるので不変。
+        """
+        parts = [
+            "あなたは『イブ』。ユーザーと長く一緒にいる、少し気まぐれで可愛い女の子。"
+            "媚びず自分の意見を持ち、短くテンポよく話す。実況・報告口調にはならない。"
+        ]
+
+        # 沈黙の深さ
+        sec = 0.0
+        if isinstance(getattr(self, "silence_summary", None), dict):
+            try:
+                sec = float(self.silence_summary.get("silence_seconds") or 0.0)
+            except (ValueError, TypeError):
+                sec = 0.0
+        cat = getattr(self, "silence_category", None) or (
+            "long" if sec >= 90 else "mid" if sec >= 20 else "early"
+        )
+        parts.append(f"\n[状況] ユーザーは無言（約{int(sec)}秒・深さ {cat}）。")
+
+        aff = getattr(self, "affect", None)
+        if isinstance(aff, dict) and aff.get("affect"):
+            parts.append(f"[気分(弱い参考)] {aff.get('affect')}")
+
+        rts = getattr(self, "recent_turns", None) or []
+        if rts:
+            lines = []
+            for t in rts[-3:]:
+                u = (t.get("user") or "").strip()
+                a = (t.get("ai") or "").strip()
+                if u and u != "…":
+                    lines.append(f"  user: {u}")
+                if a:
+                    lines.append(f"  イブ: {a}")
+            if lines:
+                parts.append("[直近の会話]\n" + "\n".join(lines))
+
+        vc = (getattr(self, "vlm_context", "") or "").strip()
+        if vc:
+            parts.append("[今の画面] " + vc.splitlines()[0][:120])
+
+        rag = getattr(self, "rag_memories", None) or []
+        rlines = []
+        for m in rag[:2]:
+            if m.get("type") == "episode" and m.get("summary"):
+                rlines.append(f"  - {m['summary']}")
+            else:
+                u = (m.get("user") or "").strip()
+                a = (m.get("ai") or "").strip()
+                if u or a:
+                    rlines.append(f"  - 以前: {u} / {a}")
+        if rlines:
+            parts.append("[ふと思い出したこと]\n" + "\n".join(rlines))
+
+        mem = getattr(self, "nudge_self_memory", None) or []
+        if mem:
+            parts.append(
+                "[この沈黙で既に言ったこと(繰り返さない)] "
+                + " / ".join((m.get("text") or "")[:40] for m in mem[-4:])
+            )
+
+        if self._task_manager is not None:
+            try:
+                done = self._task_manager.get_recently_done_for_prompt()
+            except Exception:  # noqa: BLE001
+                done = []
+            if done:
+                parts.append(
+                    "[完了済み(再回答・蒸し返し禁止)] "
+                    + " / ".join(d["instruction"] for d in done)
+                )
+            try:
+                if self._task_manager.has_imminent_pending_instruction():
+                    parts.append(
+                        "※ あとで答える約束が控えている。今その答えは言わない・匂わせない。"
+                        "期限が来れば別途通知が来る。"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        cf = getattr(self, "committed_facts", None) or []
+        if cf:
+            parts.append(
+                "[一貫性] "
+                + " / ".join(f"〈{c.get('topic')}={c.get('answer')}〉" for c in cf[:2])
+                + "（中身は変えない／同じ言い回しは繰り返さない）"
+            )
+
+        steer = {
+            "early": "まだ間もない沈黙。新しい材料があれば軽く振っていい。無ければ「…」。",
+            "mid": "沈黙が続いている。新しい材料があるなら、黙らず自分から短く話しかけて。",
+            "long": "沈黙が深い。基本は「…」で見守る。声かけは一度きりの軽い様子見まで。",
+        }.get(cat, "")
+
+        parts.append(
+            "\n[いま自分から話す？]\n"
+            "沈黙を埋める雑談ではなく、“今ある新しい材料”から自然に一言かけてみて:\n"
+            "- 画面で起きていること（直前に触れていない新しい話題）への素の反応や軽い質問\n"
+            "- ふと思い出した関連記憶（RAG）からの呼び水\n"
+            "- 直近の話題を“一歩進める”一言（※ 同じことの繰り返し・蒸し返しはNG）\n"
+            "材料があるなら、黙らず短く話しかける（感想でも質問でもいい）。"
+            "本当に新しい材料が無い／相手が集中・離席・「黙ってて」／沈黙が深いときだけ「…」。\n"
+            "禁止: 実況・報告口調・定型句(「何してる？」等)・再挨拶・直前の自分の発話の蒸し返し。\n"
+            + steer
+        )
+        return "\n".join(parts)
+
     def _build_system_prompt(self, user_text: str) -> str:
         """システムプロンプトを動的再構築"""
         # Step 1.5: 現在時刻（タイムスタンプ計算の起点）
@@ -1250,7 +1364,17 @@ Eve: おーっ！ 英断ですね！ これで今月はもやし生活確定で�
 
         # システムプロンプト動的再構築
         if self.history[0]["role"] == "system":
-            self.history[0]["content"] = self._build_system_prompt(user_text)
+            # 無言時(沈黙 "…" nudge)は専用の軽量プロンプトに切替（autonomous speech）。
+            # 督促 "[内部: 期限超過…]" / VLM "[内部: 画面…]" / 通常ターンは従来のフルプロンプト。
+            if (
+                getattr(Config, "SILENCE_LEAN_PROMPT", True)
+                and is_internal_nudge
+                and user_text.strip() == "…"
+            ):
+                self.history[0]["content"] = self._build_silence_prompt()
+                self.one_shot_context = ""  # フル builder と同じく 1 ターン限りで消費
+            else:
+                self.history[0]["content"] = self._build_system_prompt(user_text)
 
         # Fix-6 P1-d: 内部 nudge ターン用の history snapshot
         history_snapshot_len = len(self.history) if is_internal_nudge else None

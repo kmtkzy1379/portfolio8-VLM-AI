@@ -522,8 +522,13 @@ class BaseMode(ABC):
             # 「質問のみ」許可（様子聞き・確認 = 望ましい適応行動）。既に質問済みなら沈黙のみ。
             # 同じ答えの再回答はプロンプト規則・履行可視化でも止まらなかった（Tier-3 S1 0/2）
             # ため、文単位で構造的に遮断する。VLM/督促 nudge は対象外（inputが「…」の時のみ）。
+            # NOTE(2026-06-14): この rigid ゲートは「履行を無視された時の再回答」を狙ったが、
+            # [fulfill] が沈黙ストリーク中ずっと残るため、履行後の“別の話題(画面/記憶)への
+            # 自発発話まで全部ミュート”していた（S3b で実機の「タスク後に話さない」を再現）。
+            # POSTFULFILL_GATE=false で無効化し、軽量プロンプトの「再回答禁止」情報に委ねる。
             _postfulfill_mode = None
-            if is_internal_nudge and input_text.strip() == "…":
+            if (getattr(Config, "POSTFULFILL_GATE", True)
+                    and is_internal_nudge and input_text.strip() == "…"):
                 _pf_mem = getattr(self.llm, "nudge_self_memory", None) or []
                 if any(m.get("category") == "fulfill" for m in _pf_mem):
                     _asked = any((m.get("text") or "").rstrip().endswith(("？", "?"))
