@@ -299,7 +299,11 @@ async def test_g2_recently_done() -> None:
 
 
 async def test_g5_postfulfill_gate() -> None:
-    print("\n--- Fix-G5: post-fulfillment silence nudges are question-only -> then silent ---")
+    print("\n--- Fix-G5: post-fulfillment gate (now OPT-IN, default off) — exercise when enabled ---")
+    from config import Config as _Cfg
+    # 2026-06-14: G5 の blanket ゲートは履行後の“別話題への自発発話まで”ミュートしていたため
+    # 既定 off（POSTFULFILL_GATE=false）。ゲート自体のロジックは残すので、enabled 時の挙動を検証。
+    _Cfg.POSTFULFILL_GATE = True  # この test プロセス限り（throwaway process）で有効化
     fulfill_mem = [{"category": "fulfill", "text": "サーモンだよ。"}]
 
     # 1) 履行後の沈黙 nudge: 再回答（平叙文）は落ち、質問は通る

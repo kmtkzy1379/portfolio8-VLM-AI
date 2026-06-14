@@ -234,31 +234,19 @@ class TalkMode(BaseMode):
             )
             self.llm.recent_turns = recent_turns
 
-            # ① Proactivity: 沈黙時の RAG 材料は「ランダム」ではなく「いまの瞬間に関連する記憶」。
-            # クエリ = 最後の実ユーザ発話 + VLM シーン記述。cold-start / 失敗 / 空振りはランダムに退避。
-            # search_similar は embedding を叩く async なので timeout + fallback で idle ループを塞がない。
+            # ① Proactivity（2026-06-14 改訂）: 自律的発話の理想は「直近の話の続き(=遅れた二重返事)」
+            # ではなく「会話が一段落した後に、別の新しい話題・疑問を自分から振る」こと。
+            # そのため沈黙時の RAG 材料は“直近に関連する記憶”ではなく“少し前のランダムな記憶”を
+            # 新ネタの種として渡す（直近関連だと続き/再回答を誘発する）。画面情報は別途 vlm_context。
             # （base_mode:420 の survival property で、この rag_memories は内部 nudge で [] 上書きされない）
             rag_memories = []
             try:
-                _q = []
-                if recent_turns:
-                    _lu = (recent_turns[-1].get("user") or "").strip()
-                    if _lu and _lu != "…":
-                        _q.append(_lu)
-                if self.vlm_bridge and self.vlm_bridge.is_running:
-                    _vd = (self.vlm_bridge.get_scene_description() or "").strip()
-                    if _vd:
-                        _q.append(_vd)
-                _query = " / ".join(_q)
-                if _query:
-                    _t = asyncio.create_task(self.rag.search_similar(_query))
-                    rag_memories = await asyncio.wait_for(_t, timeout=1.0)
+                _t = asyncio.create_task(self.rag.get_random_turns(count=2))
+                rag_memories = await asyncio.wait_for(_t, timeout=1.0)
             except asyncio.TimeoutError:
-                self.log("System", "idle RAG search timeout - random fallback", level="debug")
+                self.log("System", "idle RAG random fetch timeout", level="debug")
             except Exception as e:
-                self.log("System", f"idle RAG search failed: {e}", level="debug")
-            if not rag_memories:
-                rag_memories = await self.rag.get_random_turns(count=2)
+                self.log("System", f"idle RAG random fetch failed: {e}", level="debug")
             self.llm.rag_memories = rag_memories
 
             # A2: カテゴリ判定クロックは silence_seconds（最後の「実」ユーザ発話起点。

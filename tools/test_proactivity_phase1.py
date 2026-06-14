@@ -54,10 +54,11 @@ class StubLLM:
 
 
 class RecordingRAG:
-    def __init__(self, raise_on_search=False):
+    def __init__(self, raise_on_search=False, raise_on_random=False):
         self.queries: list[str] = []
         self.random_calls = 0
         self.raise_on_search = raise_on_search
+        self.raise_on_random = raise_on_random
 
     async def search_similar(self, query, *a, **k):
         self.queries.append(query)
@@ -67,6 +68,8 @@ class RecordingRAG:
 
     async def get_random_turns(self, count=2):
         self.random_calls += 1
+        if self.raise_on_random:
+            raise RuntimeError("boom-random")
         return list(RANDOM)
 
 
@@ -92,43 +95,33 @@ def _make_mode(rag, recent_turns) -> TalkMode:
     return mode
 
 
-async def test_relevant_query_used_and_survives() -> None:
-    print("\n--- silence material: relevant RAG queried by last user turn, survives pipeline ---")
+async def test_random_seed_used_and_survives() -> None:
+    # 2026-06-14 改訂: 自律的発話は「直近の続き(=二重返事)」でなく「別の新しい話題」を狙う。
+    # そのため沈黙時の RAG 材料は last-turn 関連検索ではなく“少し前のランダムな記憶”を種にする。
+    print("\n--- silence material: random (non-recent) memory seed, survives pipeline ---")
     rag = RecordingRAG()
     mode = _make_mode(rag, [{"user": "さっきローグライク始めたんだ", "ai": "へえ"}])
     await mode._process_idle_input("…", is_silence_nudge=True)
-    check("search_similar was queried", len(rag.queries) == 1, f"queries={rag.queries}")
-    check("query built from last real user turn",
-          rag.queries and "ローグライク" in rag.queries[0], f"q={rag.queries[:1]}")
-    check("relevant memories survived to llm (not random, not wiped)",
-          mode.llm.rag_memories == RELEVANT, f"got={mode.llm.rag_memories}")
-    check("random fallback NOT used when relevant hit", rag.random_calls == 0)
+    check("random memory fetched as new-topic seed", rag.random_calls == 1)
+    check("search_similar NOT used for silence (avoids continuation)", len(rag.queries) == 0,
+          f"queries={rag.queries}")
+    check("random memories survived to llm (not wiped)",
+          mode.llm.rag_memories == RANDOM, f"got={mode.llm.rag_memories}")
 
 
-async def test_coldstart_falls_back_to_random() -> None:
-    print("\n--- silence material: cold-start (no real turn, no VLM) -> random fallback ---")
-    rag = RecordingRAG()
-    mode = _make_mode(rag, [])  # no recent turns
-    await mode._process_idle_input("…", is_silence_nudge=True)
-    check("no query built when nothing to query", len(rag.queries) == 0, f"queries={rag.queries}")
-    check("random fallback used", rag.random_calls == 1 and mode.llm.rag_memories == RANDOM,
-          f"got={mode.llm.rag_memories}")
-
-
-async def test_search_error_falls_back_to_random() -> None:
-    print("\n--- silence material: search_similar error -> random fallback (no crash) ---")
-    rag = RecordingRAG(raise_on_search=True)
+async def test_random_fetch_error_empty() -> None:
+    print("\n--- silence material: random fetch error -> empty, no crash ---")
+    rag = RecordingRAG(raise_on_random=True)
     mode = _make_mode(rag, [{"user": "今日は疲れた", "ai": "おつかれ"}])
     await mode._process_idle_input("…", is_silence_nudge=True)
-    check("search attempted then failed", len(rag.queries) == 1)
-    check("random fallback used on error", rag.random_calls == 1 and mode.llm.rag_memories == RANDOM,
-          f"got={mode.llm.rag_memories}")
+    check("random fetch attempted", rag.random_calls == 1)
+    check("error -> rag_memories empty (no crash, no continuation seed)",
+          mode.llm.rag_memories == [], f"got={mode.llm.rag_memories}")
 
 
 async def main() -> None:
-    await test_relevant_query_used_and_survives()
-    await test_coldstart_falls_back_to_random()
-    await test_search_error_falls_back_to_random()
+    await test_random_seed_used_and_survives()
+    await test_random_fetch_error_empty()
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
     print(f"\n=== {npass}/{total} checks passed ===")
