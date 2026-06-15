@@ -365,6 +365,37 @@ async def test_delay_seconds() -> None:
         await _teardown(tm, path)
 
 
+async def test_audit_revert_adapts() -> None:
+    """RC2: AI2 audit fulfilled=false は authoritative — DONE 強制でなく ACTIVE に戻して
+    別アプローチで再履行させる。上限(3)で DONE 打ち切り（無限ループ防止）。"""
+    print("\n--- RC2: audit fulfilled=false -> ACTIVE (adapt); 3-strike -> DONE ---")
+    tm, path = await _make_tm()
+    try:
+        now = datetime.now()
+        await _add_instruction(tm, "好きな色を答える", iso(now + timedelta(seconds=30)))
+        iid = next(iter(tm._active_instructions.keys()))
+        tm._active_instructions[iid].deadline_at = iso(now - timedelta(seconds=1))
+        await tm._reconcile_instruction_status()  # -> ACTIVE
+        statuses = []
+        for i in range(3):
+            # 実発話で履行 -> PROVISIONAL_DONE
+            tm.enqueue_command_nowait({"kind": "clear_active_instruction", "id": iid,
+                                       "status": "done", "eve_response": f"青だよ{i}", "reason": "履行"})
+            await tm.flush_command_queue()
+            # AI2 audit fulfilled=false
+            tm.enqueue_command_nowait({"kind": "revert_provisional_done", "id": iid,
+                                       "ai2_reason": "ユーザーが内容を受け取っていない"})
+            await tm.flush_command_queue()
+            statuses.append(tm.get_instruction(iid)["status"])
+        check("revert#1 -> ACTIVE (adapt, not forced DONE)", statuses[0] == "active", f"got={statuses}")
+        check("revert#2 -> ACTIVE (adapt)", statuses[1] == "active", f"got={statuses}")
+        check("revert#3 (cap reached) -> DONE", statuses[2] == "done", f"got={statuses}")
+        check("audit_reason retained on instruction (feeds re-nudge / adaptation)",
+              bool(tm._active_instructions[iid].audit_reason))
+    finally:
+        await _teardown(tm, path)
+
+
 async def main() -> None:
     # Surface the Fix-B2 correction WARN so its evidence is visible.
     logging.basicConfig(level=logging.WARNING, format="    [log] %(name)s: %(message)s")
@@ -376,6 +407,7 @@ async def main() -> None:
     await test_release_facts_on_supersede()
     await test_facet_rotation()
     await test_delay_seconds()
+    await test_audit_revert_adapts()
 
     npass = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)

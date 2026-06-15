@@ -1506,33 +1506,57 @@ class TaskManager:
             )
             return
 
-        # Fix-6 P2-c: rejection_count は反省データとして累積するが state 遷移には使わない
+        # RC2 fix (2026-06-16): AI2 を完了判定の所有者にし、fulfilled=false は authoritative。
+        # 旧 advisory（fulfilled=false でも DONE 強制）は「答えを言った後に無視/矛盾されても
+        # 平然と完了」する原因だった。新方針: ACTIVE に戻して別アプローチで再履行させ
+        # （reconcile タイマーが再 nudge）、上限回数で DONE 打ち切り（無限ループ防止）。
         inst.rejection_count += 1
         now = datetime.now()
+        max_reverts = int(getattr(Config, "AI2_AUDIT_MAX_REVERTS", 3))
 
-        # Fix-6 P2-c: revert 廃止、 DONE 強制遷移 + advisory WARN ログ
-        inst.status = InstructionStatus.DONE
-        inst.cleared_at = now.isoformat()
-        inst.cleared_reason = f"audit_advisory: kept as DONE despite fulfilled=false ({ai2_reason[:60]})"
-        inst.audit_reason = ai2_reason  # 反省データとして保持
+        if inst.rejection_count >= max_reverts:
+            # 適応の上限。Eve は答えたので DONE で打ち切り（EXPIRED の失敗 churn は避ける）。
+            inst.status = InstructionStatus.DONE
+            inst.cleared_at = now.isoformat()
+            inst.cleared_reason = f"audit_adapt_cap: {max_reverts}回再試行後に終了 ({ai2_reason[:50]})"
+            inst.audit_reason = ai2_reason
+            inst.audit_pending_at = None
+            self._activated_callback_fired.discard(iid)
+            self._audit_spawned_ids.discard(iid)
+            await self._write_queue.put({
+                "_kind": "instruction_status", "id": iid,
+                "status": InstructionStatus.DONE.value,
+                "cleared_at": inst.cleared_at, "cleared_reason": inst.cleared_reason,
+                "from": "provisional_done", "audit_reason": ai2_reason,
+                "rejection_count": inst.rejection_count, "source": "ai2_audit_cap",
+                "at": now.isoformat(),
+            })
+            task_logger.info(
+                "[Audit] %s adapt cap reached (%d) -> DONE: %s",
+                iid, inst.rejection_count, ai2_reason[:50],
+            )
+            return
+
+        # fulfilled=false → ACTIVE に戻す（grace 再開で即 EXPIRED を防ぐ / audit_reason を
+        # 再 nudge 本文に渡して「なぜ未達成か」を Eve に伝え別アプローチを促す / fired を外して
+        # 次 reconcile で再 callback）。
+        inst.status = InstructionStatus.ACTIVE
+        inst.activated_at = now.isoformat()
+        inst.audit_reason = ai2_reason
         inst.audit_pending_at = None
+        inst.provisional_response = None
         self._activated_callback_fired.discard(iid)
         self._audit_spawned_ids.discard(iid)
         await self._write_queue.put({
-            "_kind": "instruction_status",
-            "id": iid,
-            "status": InstructionStatus.DONE.value,
-            "cleared_at": inst.cleared_at,
-            "cleared_reason": inst.cleared_reason,
-            "from": "provisional_done",
-            "audit_reason": ai2_reason,
-            "rejection_count": inst.rejection_count,
-            "source": "ai2_audit_advisory",
-            "at": now.isoformat(),
+            "_kind": "instruction_status", "id": iid,
+            "status": InstructionStatus.ACTIVE.value,
+            "activated_at": inst.activated_at, "from": "provisional_done",
+            "audit_reason": ai2_reason, "rejection_count": inst.rejection_count,
+            "source": "ai2_audit_revert", "at": now.isoformat(),
         })
-        task_logger.warning(
-            "[Audit advisory] %s fulfilled=false but kept as DONE: %s (rejection_count=%d, reflection data only)",
-            iid, ai2_reason[:60], inst.rejection_count,
+        task_logger.info(
+            "[Audit] %s fulfilled=false -> ACTIVE (adapt #%d): %s",
+            iid, inst.rejection_count, ai2_reason[:50],
         )
 
     @staticmethod

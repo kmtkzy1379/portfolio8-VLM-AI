@@ -30,7 +30,9 @@ class Config:
     AI1_FREQUENCY_PENALTY = float(os.getenv("AI1_FREQUENCY_PENALTY", "0.3"))
     AI1_PRESENCE_PENALTY = float(os.getenv("AI1_PRESENCE_PENALTY", "0.3"))
     AI2_MODEL = os.getenv("AI2_MODEL_NAME", "claude-opus-4-5")
-    AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-4o")
+    # AI2 が完了判定/適応を握るため fallback も強いモデルに（ユーザー決定 2026-06-16）。
+    # Anthropic クレジット切れ中は primary(claude) が即失敗 → この gpt-5.4 fallback で稼働。
+    AI2_FALLBACK_MODEL = os.getenv("AI2_FALLBACK_MODEL", "gpt-5.4")
     AI2_MAX_TOKENS = int(os.getenv("AI2_MAX_TOKENS", "4000"))
     AI2_TEMPERATURE = float(os.getenv("AI2_TEMPERATURE", "0.6"))
     VISION_ANALYSIS_MODEL = os.getenv(
@@ -200,6 +202,9 @@ class Config:
     # RC1 fix: TaskManager の定期 reconcile 間隔（秒）。deadline 到来を応答イベント非依存で
     # 検出し、沈黙中でも時間通りに督促を発火させる。
     RECONCILE_INTERVAL_SEC = float(os.getenv("RECONCILE_INTERVAL_SEC", "1.5"))
+    # RC2 fix: AI2 audit が fulfilled=false を返した時、ACTIVE に戻して別アプローチで再試行
+    # させる上限回数。これを超えたら DONE で打ち切り（無限ループ防止）。
+    AI2_AUDIT_MAX_REVERTS = int(os.getenv("AI2_AUDIT_MAX_REVERTS", "3"))
     # 無言時(沈黙 "…" nudge)専用の軽量プロンプトを使う。フルプロンプト(~10k字)は混み合い
     # mini が文脈材料を使い切れず「…」に倒れるため、ペルソナ/FEP を簡素化し直近会話・RAG・
     # 画面・タスク・自律発話判断を前面に出す。A/B 用に env で off にもできる。
