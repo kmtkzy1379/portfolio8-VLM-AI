@@ -650,7 +650,44 @@ async def run_s6_thinking_pause(run_no: int) -> dict:
         await teardown(tm, cache, paths)
 
 
+async def run_ontime_timer(run_no: int) -> dict:
+    """RC1: deadline 到来を定期 reconcile タイマーが“手動 reconcile 無しで”検出し、
+    沈黙中でも時間通りに ACTIVE 化＋督促コールバックを発火する（実機「時間通りに実行されない」）。"""
+    mode, tm, cache, llm, paths = await make_session()
+    fired: list = []
+    tm.register_instruction_activated_callback(lambda d: fired.append((time.time(), d)))
+    res = {}
+    try:
+        t0 = time.time()
+        tm.enqueue_command_nowait({
+            "kind": "set_active_instruction", "instruction": "好きな色を答える",
+            "delay_seconds": 3, "reason": "ontime", "created_by": "ai1",
+        })
+        await tm.flush_command_queue(timeout=5.0)
+        iid = next(iter(tm._active_instructions.keys()))
+        res["OT_pending_before"] = (tm.get_instruction(iid)["status"] == "pending")
+        interval = float(getattr(Config, "RECONCILE_INTERVAL_SEC", 1.5))
+        # 手動 reconcile を一切呼ばない。背景タイマーだけに任せて待つ。
+        await asyncio.sleep(3.0 + interval + 1.5)
+        cur = tm.get_instruction(iid)
+        res["OT_active_after"] = bool(cur and cur["status"] in ("active", "provisional_done", "done"))
+        res["OT_callback_fired"] = (len(fired) >= 1)
+        if fired:
+            delay = fired[0][0] - (t0 + 3.0)  # deadline からの発火遅れ
+            res["OT_delay_sec"] = round(delay, 2)
+            res["OT_fired_on_time"] = (delay <= interval + 1.0)
+        else:
+            res["OT_fired_on_time"] = False
+        print(f"  [ontime] status={cur['status'] if cur else None} fired={len(fired)} "
+              f"delay={res.get('OT_delay_sec')}s (no manual reconcile)")
+        return res
+    finally:
+        await teardown(tm, cache, paths)
+
+
 S_SCENARIOS = {
+    "ontime": ("on-time firing via periodic timer (RC1)", run_ontime_timer,
+               ["OT_pending_before", "OT_active_after", "OT_callback_fired", "OT_fired_on_time"]),
     "s6": ("S6 thinking-pause (case A: wait, no blurt)", run_s6_thinking_pause,
            ["S6_no_new_topic_blurt", "S6_waits_silent"]),
     "s3b": ("S3b proactive-after-task (prod-like)", run_s3b_proactive_after_task,

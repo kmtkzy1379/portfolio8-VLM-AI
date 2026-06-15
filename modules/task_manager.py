@@ -92,6 +92,9 @@ class TaskManager:
         self._write_queue: asyncio.Queue = asyncio.Queue()
         self._command_worker_task: Optional[asyncio.Task] = None
         self._write_worker_task: Optional[asyncio.Task] = None
+        # RC1 fix: 定期 reconcile タイマー。これが無いと deadline は次の応答イベントまで
+        # PENDING→ACTIVE 化されず、沈黙中の履行が遅れる（実機 2026-06-16）。
+        self._reconcile_timer_task: Optional[asyncio.Task] = None
         self._stopped: bool = False
 
         # Step 1.5: active_instruction の保持と callback
@@ -218,6 +221,8 @@ class TaskManager:
         self._reconcile_with_goal_file(getattr(Config, "GOAL_FILE", "goal.txt"))
         self._command_worker_task = asyncio.create_task(self._command_worker_wrapper())
         self._write_worker_task = asyncio.create_task(self._write_worker())
+        # RC1 fix: deadline を時間通りに ACTIVE 化するための定期 reconcile タイマー。
+        self._reconcile_timer_task = asyncio.create_task(self._reconcile_timer_loop())
         # Step 1.5: 起動直後に reconcile を 1 回走らせ、再起動中に deadline 到達していた
         # instruction を ACTIVE / EXPIRED に正しく昇格させる（callback は未登録なので発火しない）
         try:
@@ -238,6 +243,24 @@ class TaskManager:
             self._command_worker_task.cancel()
         if self._write_worker_task is not None:
             self._write_worker_task.cancel()
+        if self._reconcile_timer_task is not None:
+            self._reconcile_timer_task.cancel()
+
+    async def _reconcile_timer_loop(self) -> None:
+        """RC1 fix: 定期的に instruction の derived status を reconcile し、deadline 到来を
+        応答イベント非依存で検出する（沈黙中でも時間通りに ACTIVE 化＝督促発火）。
+        reconcile はべき等（_activated_callback_fired ガード）でコールバックは put_nowait のみ。"""
+        interval = float(getattr(Config, "RECONCILE_INTERVAL_SEC", 1.5))
+        while not self._stopped:
+            try:
+                await asyncio.sleep(interval)
+                if self._installing_plan:
+                    continue
+                await self._reconcile_instruction_status()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[TaskManager] periodic reconcile error: %s", e)
 
     async def install_plan(self, plan: Optional[Plan]) -> None:
         """新 plan を active 化。`plan is None` は no-op（fail-soft）。

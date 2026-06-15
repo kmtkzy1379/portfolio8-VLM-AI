@@ -197,6 +197,9 @@ class Config:
     # Bug-B(code gate): 期限がこの秒数以内に迫った PENDING 予約がある間は沈黙 "…" nudge を
     # 発火しない（約束の早期履行をコードで遮断。プロンプト規則は gpt-5.4-mini が守れなかった）。
     IDLE_SUPPRESS_PENDING_WINDOW_SEC = float(os.getenv("IDLE_SUPPRESS_PENDING_WINDOW_SEC", "120"))
+    # RC1 fix: TaskManager の定期 reconcile 間隔（秒）。deadline 到来を応答イベント非依存で
+    # 検出し、沈黙中でも時間通りに督促を発火させる。
+    RECONCILE_INTERVAL_SEC = float(os.getenv("RECONCILE_INTERVAL_SEC", "1.5"))
     # 無言時(沈黙 "…" nudge)専用の軽量プロンプトを使う。フルプロンプト(~10k字)は混み合い
     # mini が文脈材料を使い切れず「…」に倒れるため、ペルソナ/FEP を簡素化し直近会話・RAG・
     # 画面・タスク・自律発話判断を前面に出す。A/B 用に env で off にもできる。
